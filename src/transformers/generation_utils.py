@@ -132,6 +132,7 @@ class GenerationMixin:
         attention_mask: Optional[torch.LongTensor] = None,
         decoder_start_token_id: Optional[int] = None,
         use_cache: Optional[bool] = None,
+        return_score: bool = False,
         **model_specific_kwargs
     ) -> torch.LongTensor:
         r"""
@@ -467,6 +468,7 @@ class GenerationMixin:
                 encoder_outputs=encoder_outputs,
                 attention_mask=attention_mask,
                 use_cache=use_cache,
+                return_score=return_score,
                 model_specific_kwargs=model_specific_kwargs,
             )
         else:
@@ -488,6 +490,7 @@ class GenerationMixin:
                 encoder_outputs=encoder_outputs,
                 attention_mask=attention_mask,
                 use_cache=use_cache,
+                return_score=return_score,
                 model_specific_kwargs=model_specific_kwargs,
             )
 
@@ -512,6 +515,7 @@ class GenerationMixin:
         encoder_outputs,
         attention_mask,
         use_cache,
+        return_score,
         model_specific_kwargs,
     ):
         """ Generate sequences for each example without beam search (num_beams == 1).
@@ -522,6 +526,9 @@ class GenerationMixin:
         sent_lengths = input_ids.new(batch_size).fill_(max_length)
 
         past = (encoder_outputs, None) if encoder_outputs is not None else None
+
+        if return_score:
+            seq_scores = torch.zeros((batch_size), dtype=torch.float, device=input_ids.device)
 
         while cur_len < max_length:
             model_inputs = self.prepare_inputs_for_generation(
@@ -591,7 +598,7 @@ class GenerationMixin:
                     [attention_mask, attention_mask.new_ones((attention_mask.shape[0], 1))], dim=-1
                 )
 
-        return input_ids
+        return input_ids, seq_scores if return_score else input_ids
 
     def _generate_beam_search(
         self,
@@ -618,6 +625,7 @@ class GenerationMixin:
         attention_mask,
         use_cache,
         model_specific_kwargs,
+        return_score
     ):
         """ Generate sequences for each example with beam search.
         """
@@ -823,15 +831,17 @@ class GenerationMixin:
         # select the best hypotheses
         sent_lengths = input_ids.new(output_batch_size)
         best = []
+        best_scores = []
 
         # retrieve best hypotheses
         for i, hypotheses in enumerate(generated_hyps):
             sorted_hyps = sorted(hypotheses.beams, key=lambda x: x[0])
             for j in range(output_num_return_sequences_per_batch):
                 effective_batch_idx = output_num_return_sequences_per_batch * i + j
-                best_hyp = sorted_hyps.pop()[1]
+                best_score, best_hyp = sorted_hyps.pop()
                 sent_lengths[effective_batch_idx] = len(best_hyp)
                 best.append(best_hyp)
+                best_scores.append(best_score)
 
         # shorter batches are padded
         if sent_lengths.min().item() != sent_lengths.max().item():
@@ -849,7 +859,7 @@ class GenerationMixin:
             assert (len(hypo) == max_length for hypo in best)
             decoded = torch.stack(best).type(torch.long).to(next(self.parameters()).device)
 
-        return decoded
+        return decoded, best_scores if return_score else decoded
 
     @staticmethod
     def _reorder_cache(past: Tuple, beam_idx: Tensor) -> Tuple[Tensor]:
