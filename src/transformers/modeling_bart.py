@@ -978,6 +978,7 @@ class BartForConditionalGeneration(PretrainedBartModel):
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
+        vocab_mask=None,
         **unused,
     ):
         r"""
@@ -1038,6 +1039,10 @@ class BartForConditionalGeneration(PretrainedBartModel):
         )
         lm_logits = F.linear(outputs[0], self.model.shared.weight, bias=self.final_logits_bias)
 
+        if vocab_mask is not None:
+            lm_logits.masked_fill_(~(vocab_mask.bool()), torch.finfo(lm_logits.dtype).min)
+            # lm_logits.masked_fill_(~vocab_mask, torch.finfo(lm_logits.dtype).min) # Change when gen_ga is changed to torch.bool
+
         masked_lm_loss = None
         if labels is not None:
             loss_fct = CrossEntropyLoss()
@@ -1070,6 +1075,7 @@ class BartForConditionalGeneration(PretrainedBartModel):
             "decoder_input_ids": decoder_input_ids,
             "attention_mask": attention_mask,
             "use_cache": use_cache,  # change this to avoid caching (presumably for debugging)
+            "vocab_mask": kwargs.get("vocab_mask", None),
         }
 
     def adjust_logits_during_generation(self, logits, cur_len, max_length):
