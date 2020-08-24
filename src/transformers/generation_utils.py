@@ -15,7 +15,7 @@
 # limitations under the License.
 
 import logging
-from typing import Iterable, List, Optional, Tuple
+from typing import Iterable, List, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -130,7 +130,7 @@ class GenerationMixin:
         no_repeat_ngram_size: Optional[int] = None,
         num_return_sequences: Optional[int] = None,
         attention_mask: Optional[torch.LongTensor] = None,
-        decoder_start_token_id: Optional[int, torch.LongTensor] = None,
+        decoder_start_token_id: Optional[Union[int, torch.LongTensor]] = None,
         use_cache: Optional[bool] = None,
         return_score: bool = False,
         **model_specific_kwargs
