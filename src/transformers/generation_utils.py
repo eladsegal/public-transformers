@@ -130,7 +130,7 @@ class GenerationMixin:
         no_repeat_ngram_size: Optional[int] = None,
         num_return_sequences: Optional[int] = None,
         attention_mask: Optional[torch.LongTensor] = None,
-        decoder_start_token_id: Optional[int] = None,
+        decoder_start_token_id: Optional[int, torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
         return_score: bool = False,
         **model_specific_kwargs
@@ -201,6 +201,7 @@ class GenerationMixin:
                 `What are attention masks? <../glossary.html#attention-mask>`__
             decoder_start_token_id (:obj:`int`, `optional`):
                 If an encoder-decoder model starts decoding with a different token than `bos`, the id of that token.
+                Can be also different for each batch if it is passed as tensor.
             use_cache: (:obj:`bool`, `optional`, defaults to :obj:`True`):
                 Whether or not the model should use the past last key/values attentions (if applicable to the model) to
                 speed up decoding.
@@ -413,12 +414,17 @@ class GenerationMixin:
 
         if self.config.is_encoder_decoder:
             # create empty decoder_input_ids
-            input_ids = torch.full(
-                (effective_batch_size * num_beams, 1),
-                decoder_start_token_id,
-                dtype=torch.long,
-                device=next(self.parameters()).device,
-            )
+            if isinstance(decoder_start_token_id, torch.Tensor):
+                input_ids = decoder_start_token_id.repeat_interleave(
+                    effective_batch_mult * num_beams
+                ).unsqueeze(-1)
+            else:
+                input_ids = torch.full(
+                    (effective_batch_size * num_beams, 1),
+                    decoder_start_token_id,
+                    dtype=torch.long,
+                    device=next(self.parameters()).device,
+                )
             cur_len = 1
 
             assert (
