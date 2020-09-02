@@ -16,7 +16,6 @@
 """ TF 2.0 OpenAI GPT-2 model. """
 
 
-import logging
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -43,9 +42,10 @@ from .modeling_tf_utils import (
     shape_list,
 )
 from .tokenization_utils import BatchEncoding
+from .utils import logging
 
 
-logger = logging.getLogger(__name__)
+logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "GPT2Config"
 _TOKENIZER_FOR_DOC = "GPT2Tokenizer"
@@ -252,8 +252,8 @@ class TFGPT2MainLayer(tf.keras.layers.Layer):
         self.wte.vocab_size = self.wte.weight.shape[0]
 
     def _prune_heads(self, heads_to_prune):
-        """ Prunes heads of the model.
-            heads_to_prune: dict of {layer_num: list of heads to prune in this layer}
+        """Prunes heads of the model.
+        heads_to_prune: dict of {layer_num: list of heads to prune in this layer}
         """
         raise NotImplementedError
 
@@ -417,8 +417,8 @@ class TFGPT2MainLayer(tf.keras.layers.Layer):
 
 
 class TFGPT2PreTrainedModel(TFPreTrainedModel):
-    """ An abstract class to handle weights initialization and
-        a simple interface for downloading and loading pretrained models.
+    """An abstract class to handle weights initialization and
+    a simple interface for downloading and loading pretrained models.
     """
 
     config_class = GPT2Config
@@ -431,7 +431,7 @@ class TFGPT2DoubleHeadsModelOutput(ModelOutput):
     Base class for outputs of models predicting if two sentences are consecutive or not.
 
     Args:
-        lm_logits (:obj:`tf.Tensor` of shape :obj:`(batch_size, num_choices, sequence_length, config.vocab_size)`):
+        logits (:obj:`tf.Tensor` of shape :obj:`(batch_size, num_choices, sequence_length, config.vocab_size)`):
             Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
         mc_logits (:obj:`tf.Tensor` of shape :obj:`(batch_size, num_choices)`):
             Prediction scores of the multiple choice classification head (scores for each choice before SoftMax).
@@ -454,7 +454,7 @@ class TFGPT2DoubleHeadsModelOutput(ModelOutput):
             heads.
     """
 
-    lm_logits: tf.Tensor = None
+    logits: tf.Tensor = None
     mc_logits: tf.Tensor = None
     past_key_values: Optional[List[tf.Tensor]] = None
     hidden_states: Optional[Tuple[tf.Tensor]] = None
@@ -698,34 +698,34 @@ class TFGPT2DoubleHeadsModel(TFGPT2PreTrainedModel):
         training=False,
     ):
         r"""
-        mc_token_ids (:obj:`tf.Tensor` or :obj:`Numpy array` of shape :obj:`(batch_size, num_choices)`, `optional`, default to index of the last token of the input)
-            Index of the classification token in each input sequence.
-            Selected in the range ``[0, input_ids.size(-1) - 1[``.
+            mc_token_ids (:obj:`tf.Tensor` or :obj:`Numpy array` of shape :obj:`(batch_size, num_choices)`, `optional`, default to index of the last token of the input)
+                Index of the classification token in each input sequence.
+                Selected in the range ``[0, input_ids.size(-1) - 1[``.
 
-    Return:
+        Return:
 
-    Examples::
+        Examples::
 
-        >>> import tensorflow as tf
-        >>> from transformers import GPT2Tokenizer, TFGPT2DoubleHeadsModel
+            >>> import tensorflow as tf
+            >>> from transformers import GPT2Tokenizer, TFGPT2DoubleHeadsModel
 
-        >>> tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
-        >>> model = TFGPT2DoubleHeadsModel.from_pretrained('gpt2')
+            >>> tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
+            >>> model = TFGPT2DoubleHeadsModel.from_pretrained('gpt2')
 
-        >>> # Add a [CLS] to the vocabulary (we should train it also!)
-        >>> num_added_tokens = tokenizer.add_special_tokens({'cls_token': '[CLS]'})
+            >>> # Add a [CLS] to the vocabulary (we should train it also!)
+            >>> num_added_tokens = tokenizer.add_special_tokens({'cls_token': '[CLS]'})
 
-        >>> embedding_layer = model.resize_token_embeddings(len(tokenizer))  # Update the model embeddings with the new vocabulary size
+            >>> embedding_layer = model.resize_token_embeddings(len(tokenizer))  # Update the model embeddings with the new vocabulary size
 
-        >>> choices = ["Hello, my dog is cute [CLS]", "Hello, my cat is cute [CLS]"]
-        >>> encoded_choices = [tokenizer.encode(s) for s in choices]
-        >>> cls_token_location = [tokens.index(tokenizer.cls_token_id) for tokens in encoded_choices]
+            >>> choices = ["Hello, my dog is cute [CLS]", "Hello, my cat is cute [CLS]"]
+            >>> encoded_choices = [tokenizer.encode(s) for s in choices]
+            >>> cls_token_location = [tokens.index(tokenizer.cls_token_id) for tokens in encoded_choices]
 
-        >>> input_ids = tf.constant(encoded_choices)[None, :]  # Batch size: 1, number of choices: 2
-        >>> mc_token_ids = tf.constant([cls_token_location])  # Batch size: 1
+            >>> input_ids = tf.constant(encoded_choices)[None, :]  # Batch size: 1, number of choices: 2
+            >>> mc_token_ids = tf.constant([cls_token_location])  # Batch size: 1
 
-        >>> outputs = model(input_ids, mc_token_ids=mc_token_ids)
-        >>> lm_prediction_scores, mc_prediction_scores = outputs[:2]
+            >>> outputs = model(input_ids, mc_token_ids=mc_token_ids)
+            >>> lm_prediction_scores, mc_prediction_scores = outputs[:2]
 
         """
         if isinstance(inputs, (tuple, list)):
@@ -794,7 +794,7 @@ class TFGPT2DoubleHeadsModel(TFGPT2PreTrainedModel):
             return (lm_logits, mc_logits) + transformer_outputs[1:]
 
         return TFGPT2DoubleHeadsModelOutput(
-            lm_logits=lm_logits,
+            logits=lm_logits,
             mc_logits=mc_logits,
             past_key_values=transformer_outputs.past_key_values,
             hidden_states=transformer_outputs.hidden_states,
