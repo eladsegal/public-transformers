@@ -618,7 +618,7 @@ class GenerationMixin:
             final_output_probs = output_probs
             final_output_score = torch.zeros((batch_size,)).to(next(self.parameters()).device)
             for i in range(len(final_output_probs)):
-                has_eos_token = eos_token_id in input_ids[i]
+                has_eos_token = eos_token_id in input_ids[i][1:]  # eos_token can be the decoder_start_token, so ignore it
                 length = input_ids.shape[1] - 1 if has_eos_token else input_ids.shape[1]  # Don't include eos_token in length, to keep calculations the same as in beam search
                 final_output_score[i] = torch.log(final_output_probs[i]).sum() / length
             return input_ids, final_output_score, final_output_probs
