@@ -43,6 +43,8 @@ from .file_utils import (
 from .tokenization_utils_base import BatchEncoding
 from .utils import logging
 
+from fairseq.data.data_utils import batch_by_size
+
 
 if is_sagemaker_dp_enabled():
     import smdistributed.dataparallel.torch.distributed as dist
@@ -508,6 +510,21 @@ def get_length_grouped_indices(lengths, batch_size, mega_batch_mult=None, genera
     return [i for megabatch in megabatches for i in megabatch]
 
 
+def get_length_grouped_indices_full(lengths, mega_batch_mult=None, generator=None):
+    """
+    Return a list of indices so that each slice of :obj:`batch_size` consecutive indices correspond to elements of
+    similar lengths. To do this, the indices are:
+
+    - randomly permuted
+    - sorted by length
+    """
+
+    # We need to use torch for the random part as a distributed sampler will set the random seed for torch.
+    indices = torch.randperm(len(lengths), generator=generator)
+    sorted_indices = sorted(indices.tolist(), key=lambda i: lengths[i], reverse=True)
+    return sorted_indices
+
+
 class LengthGroupedSampler(Sampler):
     r"""
     Sampler that samples indices in a way that groups together features of the dataset of roughly the same length while
@@ -621,6 +638,255 @@ class DistributedLengthGroupedSampler(DistributedSampler):
         assert len(indices) == self.num_samples
 
         return iter(indices)
+
+
+class LengthGroupedFullSampler(Sampler):
+    r"""
+    Sampler that samples indices in a way that groups together features of the dataset of roughly the same length while
+    keeping a bit of randomness.
+    """
+
+    def __init__(
+        self,
+        dataset: Dataset,
+        lengths: List[int],
+        generator=None,
+    ):
+        self.dataset = dataset
+        self.lengths = lengths
+        self.generator = generator
+
+    def __len__(self):
+        return len(self.lengths)
+
+    def __iter__(self):
+        indices = get_length_grouped_indices_full(self.lengths, generator=self.generator)
+        return iter(indices)
+
+
+class DistributedLengthGroupedFullSampler(DistributedSampler):
+    r"""
+    Distributed Sampler that samples indices in a way that groups together features of the dataset of roughly the same
+    length while keeping a bit of randomness.
+    """
+    # Copied and adapted from PyTorch DistributedSampler.
+    def __init__(
+        self,
+        dataset: Dataset,
+        num_replicas: Optional[int] = None,
+        rank: Optional[int] = None,
+        seed: int = 0,
+        drop_last: bool = False,
+        lengths: Optional[List[int]] = None,
+    ):
+        if num_replicas is None:
+            if not dist.is_available():
+                raise RuntimeError("Requires distributed package to be available")
+            num_replicas = dist.get_world_size()
+        if rank is None:
+            if not dist.is_available():
+                raise RuntimeError("Requires distributed package to be available")
+            rank = dist.get_rank()
+        self.dataset = dataset
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.epoch = 0
+        self.drop_last = drop_last
+        # If the dataset length is evenly divisible by # of replicas, then there
+        # is no need to drop any data, since the dataset will be split equally.
+        if self.drop_last and len(self.dataset) % self.num_replicas != 0:
+            # Split to nearest available length that is evenly divisible.
+            # This is to ensure each rank receives the same amount of data when
+            # using this Sampler.
+            self.num_samples = math.ceil((len(self.dataset) - self.num_replicas) / self.num_replicas)
+        else:
+            self.num_samples = math.ceil(len(self.dataset) / self.num_replicas)
+        self.total_size = self.num_samples * self.num_replicas
+        self.seed = seed
+        self.lengths = lengths
+
+    def __iter__(self) -> Iterator:
+        # Deterministically shuffle based on epoch and seed
+        g = torch.Generator()
+        g.manual_seed(self.seed + self.epoch)
+        indices = get_length_grouped_indices_full(self.lengths, generator=g)
+
+        if not self.drop_last:
+            # add extra samples to make it evenly divisible
+            indices += indices[: (self.total_size - len(indices))]
+        else:
+            # remove tail of data to make it evenly divisible.
+            indices = indices[: self.total_size]
+        assert len(indices) == self.total_size
+
+        # subsample
+        indices = indices[self.rank : self.total_size : self.num_replicas]
+        assert len(indices) == self.num_samples
+
+        return iter(indices)
+
+
+class MaxTokensBatchSampler(Sampler[List[int]]):
+    r"""Wraps another sampler to yield a dynamic mini-batch of indices.
+
+    Args:
+        sampler (Sampler or Iterable): Base sampler. Can be any iterable object
+        max_tokens (int): Maximum number of tokens to include in each yielded batch.
+    """
+
+    def __init__(
+        self,
+        sampler: Sampler[int],
+        src_lengths: List[int],
+        max_tokens: int,
+        batch_size: Optional[int],
+        required_batch_size_multiple: int = 1,
+        generator=None,
+    ) -> None:
+        # Since collections.abc.Iterable does not check for `__getitem__`, which
+        # is one way for an object to be an iterable, we don't do an `isinstance`
+        # check here.
+        if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens < 0:
+            raise ValueError("max_tokens should be an integer value, " "but got max_tokens={}".format(max_tokens))
+        if batch_size is not None:
+            if not isinstance(batch_size, int) or isinstance(batch_size, bool) or batch_size <= 0:
+                raise ValueError(
+                    "batch_size should be None or a positive integer value, "
+                    "but got batch_size={}".format(batch_size)
+                )
+        self.sampler = sampler
+        self.src_lengths = src_lengths
+        self.max_tokens = max_tokens
+        self.batch_size = batch_size
+        self.generator = generator
+
+        sorted_lengths = [src_lengths[i] for i in sampler]
+        # call fairseq cython function
+        self.mini_batches_indices: List[List[int]] = [
+            batch.tolist()
+            for batch in batch_by_size(
+                sampler,
+                None,
+                num_tokens_vec=sorted_lengths,
+                max_tokens=max_tokens,
+                max_sentences=batch_size,
+                required_batch_size_multiple=required_batch_size_multiple,
+            )
+        ]
+
+    def __iter__(self) -> Iterator[List[int]]:
+        shuffled_batches = [
+            self.mini_batches_indices[i]
+            for i in torch.randperm(len(self.mini_batches_indices), generator=self.generator)
+        ]
+        # move the largest batch to the front to OOM quickly (uses an approximation for padding)
+        approximate_toks_per_batch = [
+            max(self.src_lengths[i] for i in batch) * len(batch) for batch in shuffled_batches
+        ]
+        largest_batch_idx = np.argmax(approximate_toks_per_batch)
+        shuffled_batches[0], shuffled_batches[largest_batch_idx] = (
+            shuffled_batches[largest_batch_idx],
+            shuffled_batches[0],
+        )
+        yield from shuffled_batches
+
+    def __len__(self) -> int:
+        return len(self.mini_batches_indices)
+
+
+class DistributedMaxTokensBatchSampler(DistributedSampler):
+    r"""
+    Distributed Sampler that samples indices in a way that groups together features of the dataset of roughly the same
+    length while keeping a bit of randomness.
+    """
+    # Copied and adapted from PyTorch DistributedSampler.
+    def __init__(
+        self,
+        sampler: Sampler[int],
+        src_lengths: List[int],
+        max_tokens: int,
+        batch_size: Optional[int],
+        required_batch_size_multiple: int = 1,
+        num_replicas: Optional[int] = None,
+        rank: Optional[int] = None,
+        seed: int = 0,
+        drop_last: bool = False,
+    ):
+        if num_replicas is None:
+            if not dist.is_available():
+                raise RuntimeError("Requires distributed package to be available")
+            num_replicas = dist.get_world_size()
+        if rank is None:
+            if not dist.is_available():
+                raise RuntimeError("Requires distributed package to be available")
+            rank = dist.get_rank()
+        self.sampler = sampler
+        self.src_lengths = src_lengths
+        self.max_tokens = max_tokens
+        self.batch_size = batch_size
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.epoch = 0
+        self.drop_last = drop_last
+        self.seed = seed
+
+        # if we move the code to create mini_batches_indices to __iter__, sampler generator should be re-seeded
+        sorted_lengths = [src_lengths[i] for i in sampler]
+        # call fairseq cython function
+        self.mini_batches_indices: List[List[int]] = [
+            batch.tolist()
+            for batch in batch_by_size(
+                sampler,
+                None,
+                num_tokens_vec=sorted_lengths,
+                max_tokens=max_tokens,
+                max_sentences=batch_size,
+                required_batch_size_multiple=required_batch_size_multiple,
+            )
+        ]
+
+        # If the mini_batches_indices length is evenly divisible by # of replicas, then there
+        # is no need to drop any data, since the dataset will be split equally.
+        if self.drop_last and len(self.mini_batches_indices) % self.num_replicas != 0:
+            # Split to nearest available length that is evenly divisible.
+            # This is to ensure each rank receives the same amount of data when
+            # using this Sampler.
+            self.num_samples = math.ceil((len(self.mini_batches_indices) - self.num_replicas) / self.num_replicas)
+        else:
+            self.num_samples = math.ceil(len(self.mini_batches_indices) / self.num_replicas)
+        self.total_size = self.num_samples * self.num_replicas
+
+    def __iter__(self) -> Iterator:
+        # Deterministically shuffle based on epoch and seed
+        generator = torch.Generator()
+        generator.manual_seed(self.seed + self.epoch)
+
+        shuffled_batches = [
+            self.mini_batches_indices[i] for i in torch.randperm(len(self.mini_batches_indices), generator=generator)
+        ]
+
+        if not self.drop_last:
+            # add extra samples to make it evenly divisible
+            shuffled_batches += shuffled_batches[: (self.total_size - len(shuffled_batches))]
+        else:
+            # remove tail of data to make it evenly divisible.
+            shuffled_batches = shuffled_batches[: self.total_size]
+        assert len(shuffled_batches) == self.total_size
+
+        # subsample
+        shuffled_batches = shuffled_batches[self.rank : self.total_size : self.num_replicas]
+        assert len(shuffled_batches) == self.num_samples
+
+        # move the largest batch to the front to OOM quickly (uses an approximation for padding)
+        approximate_toks_per_batch = [
+            max(self.src_lengths[i] for i in batch) * len(batch) for batch in shuffled_batches
+        ]
+        largest_batch_idx = np.argmax(approximate_toks_per_batch)
+        shuffled_batches[0], shuffled_batches[largest_batch_idx] = (
+            shuffled_batches[largest_batch_idx],
+            shuffled_batches[0],
+        )
+        yield from shuffled_batches
 
 
 class ShardSampler(Sampler):

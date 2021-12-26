@@ -287,6 +287,17 @@ class DataCollatorForSeq2Seq:
                     feature["labels"] + remainder if padding_side == "right" else remainder + feature["labels"]
                 )
 
+        global_attention_masks = [feature["global_attention_mask"] for feature in features] if "global_attention_mask" in features[0].keys() else None
+
+        if global_attention_masks is not None:
+            max_label_length = max(len(l) for l in global_attention_masks)
+            padding_side = self.tokenizer.padding_side
+            for feature in features:
+                remainder = [0] * (max_label_length - len(feature["global_attention_mask"]))
+                feature["global_attention_mask"] = (
+                    feature["global_attention_mask"] + remainder if padding_side ==  "right"  else remainder + feature["global_attention_mask"]
+                )
+
         features = self.tokenizer.pad(
             features,
             padding=self.padding,
@@ -296,7 +307,11 @@ class DataCollatorForSeq2Seq:
         )
 
         # prepare decoder_input_ids
-        if self.model is not None and hasattr(self.model, "prepare_decoder_input_ids_from_labels"):
+        if (
+            labels is not None
+            and self.model is not None
+            and hasattr(self.model, "prepare_decoder_input_ids_from_labels")
+        ):
             decoder_input_ids = self.model.prepare_decoder_input_ids_from_labels(labels=features["labels"])
             features["decoder_input_ids"] = decoder_input_ids
 

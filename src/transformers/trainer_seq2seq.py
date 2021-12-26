@@ -13,6 +13,11 @@
 # limitations under the License.
 
 from typing import Any, Dict, List, Optional, Tuple, Union
+import json
+import math
+import os
+import time
+from collections import defaultdict
 
 import torch
 from packaging import version
@@ -21,21 +26,40 @@ from torch.utils.data import Dataset
 
 from .deepspeed import is_deepspeed_zero3_enabled
 from .trainer import Trainer
-from .trainer_utils import PredictionOutput
+from .trainer_utils import PredictionOutput, speed_metrics
 from .utils import logging
-
+from .debug_utils import DebugOption
+from .file_utils import is_torch_tpu_available
+from .decoding import decode
 
 if version.parse(torch.__version__) >= version.parse("1.6"):
     from torch.cuda.amp import autocast
+
+if is_torch_tpu_available():
+    import torch_xla.core.xla_model as xm
+    import torch_xla.debug.metrics as met
+    import torch_xla.distributed.parallel_loader as pl
 
 
 logger = logging.get_logger(__name__)
 
 
 class Seq2SeqTrainer(Trainer):
+    def __init__(
+        self, *args, untokenized_eval_dataset=None, data_args=None, output_dir: Optional[str] = None, **kwargs
+    ):
+        super().__init__(*args, **kwargs)
+        self._untokenized_eval_dataset = untokenized_eval_dataset
+        self._max_length = data_args.val_max_target_length
+        self._num_beams = data_args.num_beams
+        self._output_dir = output_dir
+        self._data_args = data_args
+        self.mock_predictions_to_assign_zero_metric_score = self.tokenizer.encode("TOO_MANY_INPUT_TOKENS",return_tensors="np")[0]
+
     def evaluate(
         self,
         eval_dataset: Optional[Dataset] = None,
+        untokenized_eval_dataset: Optional[Dataset] = None,
         ignore_keys: Optional[List[str]] = None,
         metric_key_prefix: str = "eval",
         max_length: Optional[int] = None,
@@ -70,11 +94,83 @@ class Seq2SeqTrainer(Trainer):
             A dictionary containing the evaluation loss and the potential metrics computed from the predictions. The
             dictionary also contains the epoch number which comes from the training state.
         """
-        if max_length is not None or not hasattr(self, "_max_length"):
+        if max_length is not None:
             self._max_length = max_length
-        if num_beams is not None or not hasattr(self, "_num_beams"):
+        if num_beams is not None:
             self._num_beams = num_beams
-        return super().evaluate(eval_dataset, ignore_keys=ignore_keys, metric_key_prefix=metric_key_prefix)
+
+        # memory metrics - must set up as early as possible
+        self._memory_tracker.start()
+
+        eval_dataloader = self.get_eval_dataloader(eval_dataset)
+        untokenized_eval_dataset = (
+            self._untokenized_eval_dataset if untokenized_eval_dataset is None else untokenized_eval_dataset
+        )
+        start_time = time.time()
+
+        # Temporarily disable metric computation, we will do it in the loop here.
+        compute_metrics = self.compute_metrics
+        self.compute_metrics = None
+        eval_loop = self.prediction_loop if self.args.use_legacy_prediction_loop else self.evaluation_loop
+        try:
+            eval_loop_output = eval_loop(
+                eval_dataloader,
+                description="Evaluation",
+                ignore_keys=ignore_keys,
+                metric_key_prefix=metric_key_prefix,
+            )
+        finally:
+            self.compute_metrics = compute_metrics
+
+        metrics = eval_loop_output.metrics
+
+        if eval_loop_output.predictions is not None:
+            eval_preds = self._post_process_function(untokenized_eval_dataset, eval_loop_output.predictions)
+
+            if self._output_dir is not None and self.is_world_process_zero():
+                predictions = decode(eval_preds[0], self.tokenizer, self._data_args)
+                output_prediction_file = os.path.join(
+                    self._output_dir, f"generated_predictions_eval_{self.state.global_step}.json"
+                )
+                with open(output_prediction_file, "w") as writer:
+                    json.dump(predictions, writer, indent=4)
+
+                output_labels_file = os.path.join(
+                    self._output_dir, f"eval_labels.json"
+                )
+                if not os.path.isfile(output_labels_file) :
+                    with open(output_labels_file, "w") as writer:
+                        json.dump(eval_preds[1], writer, indent=4)
+
+            if self.compute_metrics is not None:
+                metrics.update(self.compute_metrics(*eval_preds))
+
+        # Prefix all keys with metric_key_prefix + '_'
+        for key in list(metrics.keys()):
+            if not key.startswith(f"{metric_key_prefix}_"):
+                metrics[f"{metric_key_prefix}_{key}"] = metrics.pop(key)
+
+        total_batch_size = self.args.eval_batch_size * self.args.world_size
+        metrics.update(
+            speed_metrics(
+                metric_key_prefix,
+                start_time,
+                num_samples=eval_loop_output.num_samples,
+                num_steps=math.ceil(eval_loop_output.num_samples / total_batch_size),
+            )
+        )
+
+        self.log(metrics)
+
+        if DebugOption.TPU_METRICS_DEBUG in self.args.debug:
+            # tpu-comment: Logging debug metrics for PyTorch/XLA (compile, execute times, ops, etc.)
+            xm.master_print(met.metrics_report())
+
+        self.control = self.callback_handler.on_evaluate(self.args, self.state, self.control, metrics)
+
+        self._memory_tracker.stop_and_update_metrics(metrics)
+
+        return eval_loop_output.metrics
 
     def predict(
         self,
@@ -177,26 +273,29 @@ class Seq2SeqTrainer(Trainer):
         if generated_tokens.shape[-1] < gen_kwargs["max_length"]:
             generated_tokens = self._pad_tensors_to_max_len(generated_tokens, gen_kwargs["max_length"])
 
-        with torch.no_grad():
-            if self.use_amp:
-                with autocast():
-                    outputs = model(**inputs)
-            else:
-                outputs = model(**inputs)
-            if has_labels:
-                if self.label_smoother is not None:
-                    loss = self.label_smoother(outputs, inputs["labels"]).mean().detach()
+        if has_labels:
+            with torch.no_grad():
+                if self.use_amp:
+                    with autocast():
+                        outputs = model(**inputs)
                 else:
-                    loss = (outputs["loss"] if isinstance(outputs, dict) else outputs[0]).mean().detach()
-            else:
-                loss = None
+                    outputs = model(**inputs)
+                    if self.label_smoother is not None:
+                        loss = self.label_smoother(outputs, inputs["labels"]).mean().detach()
+                    else:
+                        loss = (outputs["loss"] if isinstance(outputs, dict) else outputs[0]).mean().detach()
+        else:
+            loss = None
 
         if self.args.prediction_loss_only:
             return (loss, None, None)
 
-        labels = inputs["labels"]
-        if labels.shape[-1] < gen_kwargs["max_length"]:
-            labels = self._pad_tensors_to_max_len(labels, gen_kwargs["max_length"])
+        if has_labels:
+            labels = inputs["labels"]
+            if labels.shape[-1] < gen_kwargs["max_length"]:
+                labels = self._pad_tensors_to_max_len(labels, gen_kwargs["max_length"])
+        else:
+            labels = None
 
         return (loss, generated_tokens, labels)
 
@@ -216,3 +315,22 @@ class Seq2SeqTrainer(Trainer):
         )
         padded_tensor[:, : tensor.shape[-1]] = tensor
         return padded_tensor
+
+    def _post_process_function(self, untokenized_eval_dataset, predictions):
+        id_to_prediction = {}
+        id_to_label_ids = defaultdict(list)
+
+        assert len(untokenized_eval_dataset) == len(self.eval_dataset)
+
+        for i, (instance, not_valid_for_eval) in enumerate(zip(untokenized_eval_dataset, self.eval_dataset["not_valid_for_eval"])):
+            if not_valid_for_eval:
+                id_to_prediction[instance["id"]] = self.mock_predictions_to_assign_zero_metric_score
+            else:
+                id_to_prediction[instance["id"]] = predictions[i]
+
+            if "outputs" in instance:
+                id_to_label_ids[instance["id"]] = instance["outputs"]
+            else:
+                id_to_label_ids[instance["id"]].append(instance["output"])
+
+        return id_to_prediction, id_to_label_ids

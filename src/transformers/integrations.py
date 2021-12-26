@@ -21,6 +21,7 @@ import os
 import sys
 import tempfile
 from pathlib import Path
+import json
 
 from .file_utils import is_datasets_available
 from .utils import logging
@@ -317,6 +318,22 @@ def rewrite_logs(d):
     return new_d
 
 
+def rewrite_wandb_logs(d):
+    new_d = {}
+    eval_prefix = "eval_"
+    train_prefix = "train_"
+    eval_prefix_len = len(eval_prefix)
+    train_prefix_len = len(train_prefix)
+    for k, v in d.items():
+        if k.startswith(eval_prefix):
+            new_d["eval/" + k[eval_prefix_len:]] = v
+        elif k.startswith(train_prefix):
+            new_d["train/" + k[train_prefix_len:]] = v
+        else:
+            new_d["train/" + k] = v
+    return new_d
+
+
 class TensorBoardCallback(TrainerCallback):
     """
     A :class:`~transformers.TrainerCallback` that sends the logs to `TensorBoard
@@ -446,7 +463,9 @@ class WandbCallback(TrainerCallback):
             logger.info(
                 'Automatic Weights & Biases logging enabled, to disable set os.environ["WANDB_DISABLED"] = "true"'
             )
-            combined_dict = {**args.to_sanitized_dict()}
+            with open(os.path.join(args.output_dir, "args.json"), mode="r") as f:
+                all_args = json.load(f)
+            combined_dict = {**all_args}
 
             if hasattr(model, "config") and model.config is not None:
                 model_config = model.config.to_dict()
@@ -460,11 +479,21 @@ class WandbCallback(TrainerCallback):
                 run_name = args.run_name
 
             if self._wandb.run is None:
-                self._wandb.init(
+                wandb_id_path = os.path.join(args.output_dir, "wandb_id.txt")
+                if os.path.isfile(wandb_id_path):
+                    with open(wandb_id_path, mode="r") as f:
+                        init_args["id"] = f.readline()
+                experiment = self._wandb.init(
                     project=os.getenv("WANDB_PROJECT", "huggingface"),
+                    entity=os.getenv("WANDB_ENTITY", "tau-nlp"),
                     name=run_name,
+                    resume="allow",
                     **init_args,
                 )
+                if not os.path.isfile(wandb_id_path):
+                    with open(wandb_id_path, mode="w") as f:
+                        f.write(experiment.id + "\n")
+
             # add config parameters (run may have been created manually)
             self._wandb.config.update(combined_dict, allow_val_change=True)
 
@@ -478,6 +507,12 @@ class WandbCallback(TrainerCallback):
                 self._wandb.watch(
                     model, log=os.getenv("WANDB_WATCH", "gradients"), log_freq=max(100, args.logging_steps)
                 )
+
+            for file_path in [
+                os.path.join(args.output_dir, file_name)
+                for file_name in ["git_instructions.txt", "git_diff.patch", "args.json"]
+            ]:
+                experiment.save(file_path)
 
     def on_train_begin(self, args, state, control, model=None, **kwargs):
         if self._wandb is None:
@@ -523,7 +558,7 @@ class WandbCallback(TrainerCallback):
         if not self._initialized:
             self.setup(args, state, model)
         if state.is_world_process_zero:
-            logs = rewrite_logs(logs)
+            logs = rewrite_wandb_logs(logs)
             self._wandb.log({**logs, "train/global_step": state.global_step})
 
 

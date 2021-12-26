@@ -110,6 +110,8 @@ class TrainingArguments:
             The batch size per GPU/TPU core/CPU for training.
         per_device_eval_batch_size (:obj:`int`, `optional`, defaults to 8):
             The batch size per GPU/TPU core/CPU for evaluation.
+        per_device_train_max_batch_size (:obj:`int`, `optional`, defaults to None):
+            Maximum batch size per GPU/TPU core/CPU for training.
         gradient_accumulation_steps (:obj:`int`, `optional`, defaults to 1):
             Number of updates steps to accumulate the gradients for, before performing a backward/update pass.
 
@@ -207,6 +209,8 @@ class TrainingArguments:
         fp16_full_eval (:obj:`bool`, `optional`, defaults to :obj:`False`):
             Whether to use full 16-bit precision evaluation instead of 32-bit. This will be faster and save memory but
             can harm metric values.
+        fp16_padding (:obj:`bool`, `optional`, defaults to :obj:`False`):
+            Whether to use padding for fp16.
         local_rank (:obj:`int`, `optional`, defaults to -1):
             Rank of the process during distributed training.
         tpu_num_cores (:obj:`int`, `optional`):
@@ -313,6 +317,8 @@ class TrainingArguments:
             Column name for precomputed lengths. If the column exists, grouping by length will use these values rather
             than computing them on train startup. Ignored unless :obj:`group_by_length` is :obj:`True` and the dataset
             is an instance of :obj:`Dataset`.
+        train_max_tokens (:obj:`bool`, `optional`, defaults to :obj:`False`):
+            Train with a dynamic batch size determined by a maximal number of tokens in a batch.
         report_to (:obj:`str` or :obj:`List[str]`, `optional`, defaults to :obj:`"all"`):
             The list of integrations to report the results and logs to. Supported platforms are :obj:`"azure_ml"`,
             :obj:`"comet_ml"`, :obj:`"mlflow"`, :obj:`"tensorboard"` and :obj:`"wandb"`. Use :obj:`"all"` to report to
@@ -390,6 +396,9 @@ class TrainingArguments:
             "help": "Deprecated, the use of `--per_device_eval_batch_size` is preferred."
             "Batch size per GPU/TPU core/CPU for evaluation."
         },
+    )
+    per_device_train_max_batch_size: Optional[int] = field(
+        default=None, metadata={"help": "Maximum batch size per GPU/TPU core/CPU for training."}
     )
 
     gradient_accumulation_steps: int = field(
@@ -493,6 +502,10 @@ class TrainingArguments:
         default=False,
         metadata={"help": "Whether to use full 16-bit precision evaluation instead of 32-bit"},
     )
+    fp16_padding: bool = field(
+        default=False,
+        metadata={"help": "Whether to use padding for fp16"},
+    )
     local_rank: int = field(default=-1, metadata={"help": "For distributed training: local_rank"})
 
     tpu_num_cores: Optional[int] = field(
@@ -586,6 +599,10 @@ class TrainingArguments:
         default="length",
         metadata={"help": "Column name with precomputed lengths to use when grouping by length."},
     )
+    train_max_tokens: int = field(
+        default=0,
+        metadata={"help": "Train with a dynamic batch size determined by a maximal number of tokens in a batch"},
+    )
     report_to: Optional[List[str]] = field(
         default=None, metadata={"help": "The list of integrations to report the results and logs to."}
     )
@@ -638,7 +655,7 @@ class TrainingArguments:
 
         # expand paths, if not os.makedirs("~/bar") will make directory
         # in the current directory instead of the actual home
-        #  see https://github.com/huggingface/transformers/issues/10628
+        #  see https://github.com/huggingface/transformers/issues/10628
         if self.output_dir is not None:
             self.output_dir = os.path.expanduser(self.output_dir)
         if self.logging_dir is None and self.output_dir is not None:
@@ -804,6 +821,16 @@ class TrainingArguments:
         per_device_batch_size = self.per_gpu_eval_batch_size or self.per_device_eval_batch_size
         eval_batch_size = per_device_batch_size * max(1, self.n_gpu)
         return eval_batch_size
+
+    @property
+    def train_max_batch_size(self) -> int:
+        """
+        The actual max batch size for training (may differ from :obj:`per_device_train_max_batch_size` in distributed training).
+        """
+        if self.per_device_train_max_batch_size is None:
+            return None
+        train_batch_size = self.per_device_train_max_batch_size * max(1, self.n_gpu)
+        return train_batch_size
 
     @cached_property
     @torch_required

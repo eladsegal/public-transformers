@@ -19,7 +19,7 @@ import sys
 from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser, ArgumentTypeError
 from enum import Enum
 from pathlib import Path
-from typing import Any, Iterable, List, NewType, Optional, Tuple, Union
+from typing import Any, Iterable, List, NewType, Optional, Tuple, Union, Dict
 
 
 DataClass = NewType("DataClass", Any)
@@ -143,6 +143,7 @@ class HfArgumentParser(ArgumentParser):
                     kwargs["default"] = field.default_factory()
                 else:
                     kwargs["required"] = True
+            kwargs["type"] = handle_null_arg(kwargs["type"])
             parser.add_argument(field_name, **kwargs)
 
     def parse_args_into_dataclasses(
@@ -230,3 +231,27 @@ class HfArgumentParser(ArgumentParser):
             obj = dtype(**inputs)
             outputs.append(obj)
         return (*outputs,)
+
+    def parse_dictionary_and_args(self, dictionary: Dict[str, Any]) -> Tuple[DataClass, ...]:
+        """
+        Alternative helper method that does not use `argparse` at all, instead loading a json file and populating the
+        dataclass types.
+        """
+        args = []
+        data = dictionary
+        for k, v in data.items():
+            args.extend(
+                ["--" + k, *(v if isinstance(v, list) else [str(v)])]
+            )  # add the file arguments first so command line args has precedence
+        args += sys.argv[2:]
+
+        return self.parse_args_into_dataclasses(args=args, look_for_args_file=False)
+
+def handle_null_arg(type_):
+    def func(value):
+        if value == "_null_":
+            return None
+        else:
+            return type_(value)
+
+    return func

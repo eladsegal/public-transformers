@@ -28,6 +28,8 @@ import time
 import warnings
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
+import json
+from torch.nn.parallel.distributed import DistributedDataParallel
 
 from tqdm.auto import tqdm
 
@@ -42,6 +44,7 @@ from .integrations import (  # isort: split
     is_ray_tune_available,
     run_hp_search_optuna,
     run_hp_search_ray,
+    WandbCallback,
 )
 
 import numpy as np
@@ -50,6 +53,7 @@ from packaging import version
 from torch import nn
 from torch.utils.data import DataLoader, Dataset, IterableDataset, RandomSampler, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
+import plotly.express as px
 
 from . import __version__
 from .configuration_utils import PretrainedConfig
@@ -72,7 +76,7 @@ from .modelcard import TrainingSummary
 from .modeling_utils import PreTrainedModel, unwrap_model
 from .models.auto.modeling_auto import MODEL_FOR_QUESTION_ANSWERING_MAPPING_NAMES
 from .optimization import Adafactor, AdamW, get_scheduler
-from .tokenization_utils_base import PreTrainedTokenizerBase
+from .tokenization_utils_base import PreTrainedTokenizerBase, BatchEncoding
 from .trainer_callback import (
     CallbackHandler,
     DefaultFlowCallback,
@@ -83,6 +87,10 @@ from .trainer_callback import (
     TrainerState,
 )
 from .trainer_pt_utils import (
+    MaxTokensBatchSampler,
+    DistributedMaxTokensBatchSampler,
+    LengthGroupedFullSampler,
+    DistributedLengthGroupedFullSampler,
     DistributedLengthGroupedSampler,
     DistributedSamplerWithLoop,
     DistributedTensorGatherer,
@@ -530,7 +538,7 @@ class Trainer:
         else:
             return dataset.remove_columns(ignored_columns)
 
-    def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
+    def _get_train_sampler(self, lengths: Optional[List[int]]) -> Optional[torch.utils.data.Sampler]:
         if not isinstance(self.train_dataset, collections.abc.Sized):
             return None
 
@@ -541,31 +549,18 @@ class Trainer:
 
         # Build the sampler.
         if self.args.group_by_length:
-            if is_datasets_available() and isinstance(self.train_dataset, datasets.Dataset):
-                lengths = (
-                    self.train_dataset[self.args.length_column_name]
-                    if self.args.length_column_name in self.train_dataset.column_names
-                    else None
-                )
-            else:
-                lengths = None
-            model_input_name = self.tokenizer.model_input_names[0] if self.tokenizer is not None else None
             if self.args.world_size <= 1:
-                return LengthGroupedSampler(
+                return LengthGroupedFullSampler(
                     self.train_dataset,
-                    self.args.train_batch_size,
                     lengths=lengths,
-                    model_input_name=model_input_name,
                     generator=generator,
                 )
             else:
-                return DistributedLengthGroupedSampler(
+                return DistributedLengthGroupedFullSampler(
                     self.train_dataset,
-                    self.args.train_batch_size,
                     num_replicas=self.args.world_size,
                     rank=self.args.process_index,
                     lengths=lengths,
-                    model_input_name=model_input_name,
                     seed=self.args.seed,
                 )
 
@@ -594,6 +589,23 @@ class Trainer:
                     seed=self.args.seed,
                 )
 
+    def _get_single_process_train_sampler(
+        self, lengths: List[int], generator: torch.Generator
+    ) -> Optional[torch.utils.data.Sampler]:
+        if not isinstance(self.train_dataset, collections.abc.Sized):
+            return None
+
+        # Build the sampler.
+        if self.args.group_by_length:
+            return LengthGroupedFullSampler(
+                self.train_dataset,
+                lengths=lengths,
+                generator=generator,
+            )
+
+        else:
+            return RandomSampler(self.train_dataset, generator=generator)
+
     def get_train_dataloader(self) -> DataLoader:
         """
         Returns the training :class:`~torch.utils.data.DataLoader`.
@@ -610,35 +622,101 @@ class Trainer:
         if is_datasets_available() and isinstance(train_dataset, datasets.Dataset):
             train_dataset = self._remove_unused_columns(train_dataset, description="training")
 
-        if isinstance(train_dataset, torch.utils.data.IterableDataset):
-            if self.args.world_size > 1:
-                train_dataset = IterableDatasetShard(
+        lengths = None
+        if self.args.train_max_tokens > 0 or self.args.group_by_length:
+            if isinstance(train_dataset, torch.utils.data.IterableDataset):
+                raise ValueError(
+                    "IterableDataset is currently not supported with train_max_tokens > 0 and group_by_length"
+                )
+
+            if isinstance(self.train_dataset, datasets.Dataset):
+                lengths = (
+                    self.train_dataset[self.args.length_column_name]
+                    if self.args.length_column_name in self.train_dataset.column_names
+                    else None
+                )
+            if lengths is None:
+                dataset = self.train_dataset
+                model_input_name = self.tokenizer.model_input_names[0] if self.tokenizer is not None else "input_ids"
+                if (
+                    not (isinstance(dataset[0], dict) or isinstance(dataset[0], BatchEncoding))
+                    or model_input_name not in dataset[0]
+                ):
+                    raise ValueError(
+                        "Can only automatically infer lengths for datasets whose items are dictionaries with an "
+                        f"'{model_input_name}' key."
+                    )
+                lengths = [len(feature[model_input_name]) for feature in dataset]
+        else:
+            if isinstance(train_dataset, torch.utils.data.IterableDataset):
+                if self.args.world_size > 1:
+                    train_dataset = IterableDatasetShard(
+                        train_dataset,
+                        batch_size=self.args.train_batch_size,
+                        drop_last=self.args.dataloader_drop_last,
+                        num_processes=self.args.world_size,
+                        process_index=self.args.process_index,
+                    )
+
+                return DataLoader(
                     train_dataset,
                     batch_size=self.args.train_batch_size,
+                    collate_fn=self.data_collator,
+                    num_workers=self.args.dataloader_num_workers,
+                    pin_memory=self.args.dataloader_pin_memory,
+                )
+
+        if self.args.train_max_tokens > 0:
+            generator = None
+            if self.args.world_size <= 1:
+                generator = torch.Generator()
+                generator.manual_seed(int(torch.empty((), dtype=torch.int64).random_().item()))
+
+            # We must get a sampler on the full data,
+            # in order to get the same number of batches for each process afterwards in MaxTokenSampler
+            train_sampler = self._get_single_process_train_sampler(lengths, generator)
+
+            if self.args.world_size <= 1:
+                max_tokens_sampler = MaxTokensBatchSampler(
+                    train_sampler,
+                    lengths,
+                    max_tokens=self.args.train_max_tokens,
+                    batch_size=self.args.train_max_batch_size,
+                    required_batch_size_multiple=8 if self.args.fp16 and self.args.fp16_padding else 1,
+                    generator=generator,
+                )
+            else:
+                max_tokens_sampler = DistributedMaxTokensBatchSampler(
+                    train_sampler,
+                    lengths,
+                    max_tokens=self.args.train_max_tokens,
+                    batch_size=self.args.train_max_batch_size,
+                    required_batch_size_multiple=8 if self.args.fp16 and self.args.fp16_padding else 1,
+                    num_replicas=self.args.world_size,
+                    rank=self.args.process_index,
+                    seed=self.args.seed,
                     drop_last=self.args.dataloader_drop_last,
-                    num_processes=self.args.world_size,
-                    process_index=self.args.process_index,
                 )
 
             return DataLoader(
                 train_dataset,
-                batch_size=self.args.train_batch_size,
+                batch_sampler=max_tokens_sampler,
                 collate_fn=self.data_collator,
                 num_workers=self.args.dataloader_num_workers,
                 pin_memory=self.args.dataloader_pin_memory,
             )
+        else:
+            train_sampler = self._get_train_sampler(lengths)
 
-        train_sampler = self._get_train_sampler()
-
-        return DataLoader(
-            train_dataset,
-            batch_size=self.args.train_batch_size,
-            sampler=train_sampler,
-            collate_fn=self.data_collator,
-            drop_last=self.args.dataloader_drop_last,
-            num_workers=self.args.dataloader_num_workers,
-            pin_memory=self.args.dataloader_pin_memory,
-        )
+            return DataLoader(
+                train_dataset,
+                batch_size=self.args.train_batch_size,
+                sampler=train_sampler,
+                collate_fn=self.data_collator,
+                drop_last=self.args.dataloader_drop_last,
+                num_workers=self.args.dataloader_num_workers,
+                pin_memory=self.args.dataloader_pin_memory,
+            )
 
     def _get_eval_sampler(self, eval_dataset: Dataset) -> Optional[torch.utils.data.Sampler]:
         # Deprecated code
@@ -1090,7 +1168,8 @@ class Trainer:
         # number of training epochs: num_train_epochs
         # number of training steps per epoch: num_update_steps_per_epoch
         # total number of training steps to execute: max_steps
-        total_train_batch_size = args.train_batch_size * args.gradient_accumulation_steps * args.world_size
+        if self.args.train_max_tokens == 0:
+            total_train_batch_size = args.train_batch_size * args.gradient_accumulation_steps * args.world_size
         if train_dataset_is_sized:
             num_update_steps_per_epoch = len(train_dataloader) // args.gradient_accumulation_steps
             num_update_steps_per_epoch = max(num_update_steps_per_epoch, 1)
@@ -1101,7 +1180,9 @@ class Trainer:
                 )
                 # May be slightly incorrect if the last batch in the training datalaoder has a smaller size but it's
                 # the best we can do.
-                num_train_samples = args.max_steps * total_train_batch_size
+                num_train_samples = (
+                    args.max_steps * total_train_batch_size if self.args.train_max_tokens == 0 else None
+                )
             else:
                 max_steps = math.ceil(args.num_train_epochs * num_update_steps_per_epoch)
                 num_train_epochs = math.ceil(args.num_train_epochs)
@@ -1112,7 +1193,7 @@ class Trainer:
             # Setting a very large number of epochs so we go as many times as necessary over the iterator.
             num_train_epochs = sys.maxsize
             num_update_steps_per_epoch = max_steps
-            num_train_samples = args.max_steps * total_train_batch_size
+            num_train_samples = args.max_steps * total_train_batch_size if self.args.train_max_tokens == 0 else None
 
         if DebugOption.UNDERFLOW_OVERFLOW in self.args.debug:
             if self.args.n_gpu > 1:
@@ -1157,15 +1238,22 @@ class Trainer:
         # self.model_wrapped is DDP(Transformers Model), Deepspeed(Transformers Model), etc.
 
         # Train!
-        num_examples = (
-            self.num_examples(train_dataloader) if train_dataset_is_sized else total_train_batch_size * args.max_steps
-        )
+        if train_dataset_is_sized:
+            num_examples = self.num_examples(train_dataloader)
+        elif self.args.train_max_tokens == 0:
+            num_examples = total_train_batch_size * args.max_steps
+        else:
+            num_examples = None
 
         logger.info("***** Running training *****")
-        logger.info(f"  Num examples = {num_examples}")
+        if num_examples is not None:
+            logger.info(f"  Num examples = {num_examples}")
         logger.info(f"  Num Epochs = {num_train_epochs}")
-        logger.info(f"  Instantaneous batch size per device = {args.per_device_train_batch_size}")
-        logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_train_batch_size}")
+        if self.args.train_max_tokens == 0:
+            logger.info(f"  Instantaneous batch size per device = {args.per_device_train_batch_size}")
+            logger.info(
+                f"  Total train batch size (w. parallel, distributed & accumulation) = {total_train_batch_size}"
+            )
         logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
         logger.info(f"  Total optimization steps = {max_steps}")
 
@@ -1223,6 +1311,40 @@ class Trainer:
 
         self.control = self.callback_handler.on_train_begin(args, self.state, self.control)
 
+        # Log dynamic batch sizes here
+        if hasattr(train_dataloader.batch_sampler, "mini_batches_indices"):
+            for cb in self.callback_handler.callbacks:
+                if isinstance(cb, WandbCallback):
+                    batch_sizes = [
+                        len(mini_batch) for mini_batch in train_dataloader.batch_sampler.mini_batches_indices
+                    ]
+                    batch_sizes_histogram_plot = px.histogram(
+                        dict(batch_size=batch_sizes),
+                        x="batch_size",
+                        range_x=(0, max(batch_sizes) + 1),
+                        nbins=max(batch_sizes),
+                    )
+                    cb.on_log(
+                        self.args, self.state, self.control, logs={"train_batch_sizes": batch_sizes_histogram_plot}
+                    )
+
+                    tokens_per_batch = [
+                        sum(train_dataloader.batch_sampler.src_lengths[i] for i in mini_batch)
+                        for mini_batch in train_dataloader.batch_sampler.mini_batches_indices
+                    ]
+                    tokens_per_batch_histogram_plot = px.histogram(
+                        dict(tokens_per_batch=tokens_per_batch),
+                        x="tokens_per_batch",
+                        range_x=(0, max(tokens_per_batch) + 1),
+                        nbins=max(tokens_per_batch),
+                    )
+                    cb.on_log(
+                        self.args,
+                        self.state,
+                        self.control,
+                        logs={"train_tokens_per_batch": tokens_per_batch_histogram_plot},
+                    )
+
         # Skip the first epochs_trained epochs to get the random state of the dataloader at the right point.
         if not args.ignore_data_skip:
             for epoch in range(epochs_trained):
@@ -1230,6 +1352,8 @@ class Trainer:
                 for _ in train_dataloader:
                     break
 
+        checked_unused_parameters = args.parallel_mode != ParallelMode.DISTRIBUTED  # Don't check if not in DDP
+        total_padding_count = torch.tensor(0, device=args.device)
         for epoch in range(epochs_trained, num_train_epochs):
             if isinstance(train_dataloader, DataLoader) and isinstance(train_dataloader.sampler, DistributedSampler):
                 train_dataloader.sampler.set_epoch(epoch)
@@ -1252,6 +1376,10 @@ class Trainer:
             self.control = self.callback_handler.on_epoch_begin(args, self.state, self.control)
 
             for step, inputs in enumerate(epoch_iterator):
+                padding_count = torch.sum(inputs["input_ids"].flatten() == self.tokenizer.pad_token_id).to(args.device)
+                # print(f"Current-#{step}: {args.device}: {padding_count.item()}")
+                total_padding_count += torch.sum(self._nested_gather(padding_count))
+                # print(f"Total-#{step}: {args.device}: {total_padding_count.item()}")
 
                 # Skip past any already trained steps if resuming training
                 if steps_trained_in_current_epoch > 0:
@@ -1278,6 +1406,14 @@ class Trainer:
                         tr_loss += self.training_step(model, inputs)
                 else:
                     tr_loss += self.training_step(model, inputs)
+
+                if not checked_unused_parameters:
+                    logger.info("Unused parameters:")
+                    for name, param in model.named_parameters():
+                        if param.grad is None:
+                            logger.info(name)
+                    checked_unused_parameters = True
+
                 self.current_flos += float(self.floating_point_ops(inputs))
 
                 # Optimizer step for deepspeed must be called on every step regardless of the value of gradient_accumulation_steps
@@ -1333,7 +1469,14 @@ class Trainer:
                     self.state.epoch = epoch + (step + 1) / steps_in_epoch
                     self.control = self.callback_handler.on_step_end(args, self.state, self.control)
 
-                    self._maybe_log_save_evaluate(tr_loss, model, trial, epoch, ignore_keys_for_eval)
+                    self._maybe_log_save_evaluate(
+                        tr_loss,
+                        model,
+                        trial,
+                        epoch,
+                        ignore_keys_for_eval,
+                        {"padding_count": total_padding_count.item()},
+                    )
                 else:
                     self.control = self.callback_handler.on_substep_end(args, self.state, self.control)
 
@@ -1341,7 +1484,9 @@ class Trainer:
                     break
 
             self.control = self.callback_handler.on_epoch_end(args, self.state, self.control)
-            self._maybe_log_save_evaluate(tr_loss, model, trial, epoch, ignore_keys_for_eval)
+            self._maybe_log_save_evaluate(
+                tr_loss, model, trial, epoch, ignore_keys_for_eval, {"padding_count": total_padding_count}
+            )
 
             if DebugOption.TPU_METRICS_DEBUG in self.args.debug:
                 if is_torch_tpu_available():
@@ -1418,9 +1563,9 @@ class Trainer:
         if len(load_result.unexpected_keys) != 0:
             logger.warn(f"There were unexpected keys in the checkpoint model loaded: {load_result.unexpected_keys}.")
 
-    def _maybe_log_save_evaluate(self, tr_loss, model, trial, epoch, ignore_keys_for_eval):
+    def _maybe_log_save_evaluate(self, tr_loss, model, trial, epoch, ignore_keys_for_eval, logs_addition={}):
         if self.control.should_log:
-            logs: Dict[str, float] = {}
+            logs: Dict[str, float] = logs_addition
             tr_loss_scalar = tr_loss.item()
             # reset tr_loss to zero
             tr_loss -= tr_loss
@@ -1436,7 +1581,13 @@ class Trainer:
 
         metrics = None
         if self.control.should_evaluate:
+            config = model.module.config if isinstance(model, DistributedDataParallel) else model.config
+            if hasattr(config, "use_cache"):
+                use_cache = config.use_cache
+                config.use_cache = True
             metrics = self.evaluate(ignore_keys=ignore_keys_for_eval)
+            if hasattr(config, "use_cache"):
+                config.use_cache = use_cache
             self._report_to_hp_search(trial, epoch, metrics)
 
         if self.control.should_save:

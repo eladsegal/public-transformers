@@ -141,10 +141,11 @@ class LEDEncoderSelfAttention(nn.Module):
         self.key = nn.Linear(config.hidden_size, self.embed_dim)
         self.value = nn.Linear(config.hidden_size, self.embed_dim)
 
-        # separate projection layers for tokens with global attention
-        self.query_global = nn.Linear(config.hidden_size, self.embed_dim)
-        self.key_global = nn.Linear(config.hidden_size, self.embed_dim)
-        self.value_global = nn.Linear(config.hidden_size, self.embed_dim)
+        if not config.remove_global_attention:
+            # separate projection layers for tokens with global attention
+            self.query_global = nn.Linear(config.hidden_size, self.embed_dim)
+            self.key_global = nn.Linear(config.hidden_size, self.embed_dim)
+            self.value_global = nn.Linear(config.hidden_size, self.embed_dim)
 
         self.dropout = config.attention_probs_dropout_prob
 
@@ -586,7 +587,7 @@ class LEDEncoderSelfAttention(nn.Module):
         # attn = torch.einsum('blhs,bshd->blhd', (selected_attn_probs, selected_v))
         # compute attn output only global
         attn_output_only_global = torch.matmul(
-            attn_probs_only_global.transpose(1, 2), value_vectors_only_global.transpose(1, 2)
+            attn_probs_only_global.transpose(1, 2).clone(), value_vectors_only_global.transpose(1, 2).clone()
         ).transpose(1, 2)
 
         # reshape attn probs
@@ -2064,10 +2065,10 @@ class LEDDecoder(LEDPreTrainedModel):
             if getattr(self.config, "gradient_checkpointing", False) and self.training:
 
                 if use_cache:
-                    logger.warning(
-                        "`use_cache=True` is incompatible with `config.gradient_checkpointing=True`. Setting "
-                        "`use_cache=False`..."
-                    )
+                    # logger.warning(
+                    #     "`use_cache=True` is incompatible with `config.gradient_checkpointing=True`. Setting "
+                    #     "`use_cache=False`..."
+                    # )
                     use_cache = False
 
                 def create_custom_forward(module):

@@ -84,6 +84,8 @@ class LEDConfig(PretrainedConfig):
             Whether or not the model should return the last key/values attentions (not used by all models)
         gradient_checkpointing (:obj:`bool`, `optional`, defaults to :obj:`False`):
             If True, use gradient checkpointing to save memory at the expense of slower backward pass.
+        remove_global_attention (:obj:`bool`, `optional`, defaults to :obj:`False`):
+            If True, remove global attention weight matrices.
 
         Example::
 
@@ -127,6 +129,7 @@ class LEDConfig(PretrainedConfig):
         bos_token_id=0,
         eos_token_id=2,
         gradient_checkpointing=False,
+        remove_global_attention=False,
         attention_window: Union[List[int], int] = 512,
         **kwargs
     ):
@@ -161,6 +164,7 @@ class LEDConfig(PretrainedConfig):
         self.num_hidden_layers = encoder_layers
         self.attention_window = attention_window
         self.gradient_checkpointing = gradient_checkpointing
+        self.remove_global_attention = remove_global_attention
 
     @property
     def num_attention_heads(self) -> int:
