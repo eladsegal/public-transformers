@@ -485,7 +485,6 @@ class WandbCallback(TrainerCallback):
                         init_args["id"] = f.readline()
                 experiment = self._wandb.init(
                     project=os.getenv("WANDB_PROJECT", "huggingface"),
-                    entity=os.getenv("WANDB_ENTITY", "tau-nlp"),
                     name=run_name,
                     resume="allow",
                     **init_args,
