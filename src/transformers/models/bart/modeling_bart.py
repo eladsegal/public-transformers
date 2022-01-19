@@ -1023,10 +1023,10 @@ class BartDecoder(BartPretrainedModel):
             if getattr(self.config, "gradient_checkpointing", False) and self.training:
 
                 if use_cache:
-                    logger.warning(
-                        "`use_cache=True` is incompatible with `config.gradient_checkpointing=True`. Setting "
-                        "`use_cache=False`..."
-                    )
+                    # logger.warning(
+                    #     "`use_cache=True` is incompatible with `config.gradient_checkpointing=True`. Setting "
+                    #     "`use_cache=False`..."
+                    # )
                     use_cache = False
 
                 def create_custom_forward(module):
