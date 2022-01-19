@@ -273,16 +273,19 @@ class Seq2SeqTrainer(Trainer):
         if generated_tokens.shape[-1] < gen_kwargs["max_length"]:
             generated_tokens = self._pad_tensors_to_max_len(generated_tokens, gen_kwargs["max_length"])
 
-        with torch.no_grad():
-            with autocast():
-                outputs = model(**inputs)
-            if has_labels:
+        if has_labels:
+            with torch.no_grad():
+                if self.use_amp:
+                    with autocast():
+                        outputs = model(**inputs)
+                else:
+                    outputs = model(**inputs)
                 if self.label_smoother is not None:
                     loss = self.label_smoother(outputs, inputs["labels"]).mean().detach()
                 else:
                     loss = (outputs["loss"] if isinstance(outputs, dict) else outputs[0]).mean().detach()
-            else:
-                loss = None
+        else:
+            loss = None
 
         if self.args.prediction_loss_only:
             return (loss, None, None)
