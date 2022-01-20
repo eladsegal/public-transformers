@@ -2178,6 +2178,9 @@ class Trainer:
             A dictionary containing the evaluation loss and the potential metrics computed from the predictions. The
             dictionary also contains the epoch number which comes from the training state.
         """
+        self.state.is_local_process_zero = self.is_local_process_zero()
+        self.state.is_world_process_zero = self.is_world_process_zero()
+
         # memory metrics - must set up as early as possible
         self._memory_tracker.start()
 
@@ -2250,6 +2253,9 @@ class Trainer:
             - metrics (:obj:`Dict[str, float]`, `optional`): The potential dictionary of metrics (if the dataset
               contained labels).
         """
+        self.state.is_local_process_zero = self.is_local_process_zero()
+        self.state.is_world_process_zero = self.is_world_process_zero()
+
         # memory metrics - must set up as early as possible
         self._memory_tracker.start()
 
