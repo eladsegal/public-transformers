@@ -99,6 +99,9 @@ class Seq2SeqTrainer(Trainer):
         if num_beams is not None:
             self._num_beams = num_beams
 
+        self.state.is_local_process_zero = self.is_local_process_zero()
+        self.state.is_world_process_zero = self.is_world_process_zero()
+
         # memory metrics - must set up as early as possible
         self._memory_tracker.start()
 
