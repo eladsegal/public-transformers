@@ -2190,8 +2190,10 @@ class PreTrainedModel(
                 # Apply the change (on the internal attr, to avoid setting it recursively)
                 self.config._experts_implementation_internal = requested_implementation
 
-        # Apply it to all submodels as well
-        for submodule in self.modules():
+        # Decorated experts can retain copied per-layer configs. Track the nearest owning model so those copies receive
+        # the implementation already validated for that model, including its value in a composite-model dict.
+        model_configs = {"": self.config}
+        for module_name, submodule in self.named_modules():
             # We found a submodel (which is not self) with a different config (otherwise, it may be the same "actual model",
             # e.g. ForCausalLM has a Model inside, but no need to check it again)
             if (
@@ -2213,6 +2215,17 @@ class PreTrainedModel(
                 # Check the module can use correctly, otherwise we raise an error if requested experts can't be set for submodule
                 sub_implementation = submodule.get_correct_experts_implementation(sub_implementation)
                 submodule.config._experts_implementation_internal = sub_implementation
+
+            if isinstance(submodule, PreTrainedModel):
+                model_configs[module_name] = submodule.config
+            elif getattr(submodule, "_uses_experts_implementation", False):
+                # Expert modules may be nested below ordinary nn.Modules, so find their closest PreTrainedModel ancestor.
+                owner_name = module_name.rpartition(".")[0]
+                while owner_name not in model_configs:
+                    owner_name = owner_name.rpartition(".")[0]
+                owner_config = model_configs[owner_name]
+                if submodule.config is not owner_config:
+                    submodule.config._experts_implementation_internal = owner_config._experts_implementation
 
     def enable_input_require_grads(self):
         """

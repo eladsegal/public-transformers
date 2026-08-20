@@ -556,6 +556,9 @@ def use_experts_implementation(
     def wrapper(experts_class: type[torch.nn.Module]) -> type[torch.nn.Module]:
         original_init = experts_class.__init__
         original_forward = experts_class.forward
+        # Every PreTrainedConfig has an experts implementation field, so the model setter needs an explicit way to
+        # distinguish modules that actually dispatch their forward pass through that field.
+        setattr(experts_class, "_uses_experts_implementation", True)
 
         @wraps(original_init)
         def __init__(self, config, *args, **kwargs):
