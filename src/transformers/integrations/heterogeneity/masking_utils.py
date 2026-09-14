@@ -17,12 +17,16 @@ from __future__ import annotations
 
 from collections.abc import Callable, Hashable
 from functools import wraps
-from inspect import signature
+from inspect import signature, unwrap
 from typing import TYPE_CHECKING, Any
 
 
 if TYPE_CHECKING:
     from transformers import PreTrainedConfig
+
+
+# Defaults match the mask factories when an attribute is absent from the config.
+_COMMON_MASK_AFFECTING_ATTRIBUTES = {"is_causal": True, "_attn_implementation": None}
 
 
 class AttentionMasksByLayerIdx(dict[int, Any]):
@@ -56,6 +60,25 @@ def support_per_layer_mask_creation(attribute_name: str) -> Callable:
     return decorator
 
 
+def _get_mask_layer_indices(config: PreTrainedConfig, create_mask_fn: Callable) -> range | list[int]:
+    layer_patterns = getattr(config, "layer_types", None)
+    if layer_patterns is None:
+        return range(config.num_hidden_layers)
+
+    # The shared masking module imports this decorator, so load its registry only when creating masks.
+    from transformers.masking_utils import LAYER_PATTERN_TO_MASK_FUNCTION_MAPPING
+
+    matching_patterns = set()
+    # The registry holds decorated factories; compare their underlying functions.
+    mask_fn = unwrap(create_mask_fn)
+    for pattern, entry in LAYER_PATTERN_TO_MASK_FUNCTION_MAPPING.items():
+        mask_functions = entry.values() if isinstance(entry, dict) else (entry,)
+        if any(unwrap(fn) is mask_fn for fn in mask_functions):
+            matching_patterns.add(pattern)
+
+    return [idx for idx, pattern in enumerate(layer_patterns) if pattern in matching_patterns]
+
+
 def _get_cache_geometry(
     past_key_values: Any,
     query_length: Any,
@@ -71,19 +94,19 @@ def _get_cache_geometry(
 
 
 def _get_mask_reuse_key(
-    attribute_value: Any,
+    mask_settings: tuple[Any, ...],
     past_key_values: Any,
     query_length: Any,
     layer_idx: int,
 ) -> tuple[Any, ...] | None:
-    if not isinstance(attribute_value, Hashable):
+    if not all(isinstance(value, Hashable) for value in mask_settings):
         return None
 
     cache_geometry = _get_cache_geometry(past_key_values, query_length, layer_idx)
     if cache_geometry is None:
         return None
 
-    return attribute_value, cache_geometry
+    return mask_settings, cache_geometry
 
 
 def create_attention_masks_by_layer_idx(
@@ -94,25 +117,28 @@ def create_attention_masks_by_layer_idx(
     **kwargs: Any,
 ) -> AttentionMasksByLayerIdx:
     attention_masks = AttentionMasksByLayerIdx()
-    # Reuse assumes that the per-layer value of `attribute_name` is the only `per_layer_config` override that affects
-    # mask creation. `is_causal` and `_attn_implementation` also affect masks, but are assumed not to vary by layer.
     masks_by_reuse_key: dict[tuple[Any, ...], Any] = {}
     disabled_kv_layer_indices = set(config.get_disabled_kv_layer_indices())
     past_key_values = kwargs.get("past_key_values")
 
-    for layer_idx in range(config.num_hidden_layers):
+    for layer_idx in _get_mask_layer_indices(config, create_mask_fn):
         if layer_idx in disabled_kv_layer_indices:
             attention_masks[layer_idx] = None
             continue
 
+        # Resolving a layer config copies it, which currently prevents full-graph compilation of this path.
         layer_config = config.per_layer_config[layer_idx]
         attribute_value = getattr(layer_config, attribute_name)
         if attribute_value is None:
             continue
 
         layer_kwargs = {**kwargs, "layer_idx": layer_idx}
-        reuse_key = _get_mask_reuse_key(
+        mask_settings = (
             attribute_value,
+            *(getattr(layer_config, name, default) for name, default in _COMMON_MASK_AFFECTING_ATTRIBUTES.items()),
+        )
+        reuse_key = _get_mask_reuse_key(
+            mask_settings,
             past_key_values,
             layer_kwargs["inputs_embeds"].shape[1],
             layer_idx,

@@ -24,7 +24,7 @@ from types import MethodType
 from typing import TYPE_CHECKING, Any
 
 from transformers.integrations.heterogeneity.heterogeneous_modeling_spec import (
-    SkipDescriptor,
+    SkipDescriptors,
     get_heterogeneous_modeling_spec,
 )
 from transformers.integrations.heterogeneity.layer_idx_resolvers import LayerIdxResolver

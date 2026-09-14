@@ -26,7 +26,7 @@ if is_torch_available():
     from transformers.integrations.heterogeneity import (
         HeterogeneousModelingSpec,
         LayerIdxFromArgument,
-        SkipDescriptor,
+        SkipReplacement,
         get_heterogeneous_modeling_spec,
         nest_skip_descriptor_paths,
     )
@@ -36,23 +36,23 @@ if is_torch_available():
 class TestHeterogeneousModelingSpec(unittest.TestCase):
     def test_nest_skip_descriptor_paths_returns_nested_copies(self):
         skip_descriptors = {
-            "mixer": SkipDescriptor(
-                replacements={
-                    "norm": torch.nn.Identity,
-                    ("mixer", torch.nn.Linear): torch.nn.Identity,
-                },
-                replaces_kv_cache_updater=True,
-            )
+            "mixer": {
+                "norm": SkipReplacement(factory=torch.nn.Identity, replaces_kv_cache_updater=False),
+                ("mixer", torch.nn.Linear): SkipReplacement(factory=torch.nn.Identity, replaces_kv_cache_updater=True),
+            }
         }
 
         nested_descriptors = nest_skip_descriptor_paths(skip_descriptors, parent_path="wrapper.block")
 
         self.assertEqual(
-            set(nested_descriptors["mixer"].replacements),
+            set(nested_descriptors["mixer"]),
             {"wrapper.block.norm", ("wrapper.block.mixer", torch.nn.Linear)},
         )
-        self.assertTrue(nested_descriptors["mixer"].replaces_kv_cache_updater)
-        self.assertEqual(set(skip_descriptors["mixer"].replacements), {"norm", ("mixer", torch.nn.Linear)})
+        nested_replacements = nested_descriptors["mixer"]
+        self.assertFalse(nested_replacements["wrapper.block.norm"].replaces_kv_cache_updater)
+        self.assertTrue(nested_replacements[("wrapper.block.mixer", torch.nn.Linear)].replaces_kv_cache_updater)
+        self.assertIsInstance(nested_replacements["wrapper.block.norm"].factory(), torch.nn.Identity)
+        self.assertEqual(set(skip_descriptors["mixer"]), {"norm", ("mixer", torch.nn.Linear)})
         self.assertIsNone(nest_skip_descriptor_paths(None, parent_path="wrapper.block"))
 
     def test_get_heterogeneous_modeling_spec_uses_custom_model_spec(self):
