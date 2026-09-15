@@ -42,7 +42,8 @@ class _LayerInitContext:
     model: PreTrainedModel
     layer_cls: type[nn.Module]
     layer_idx_resolver: LayerIdxResolver
-    skip_descriptors: dict[str, SkipDescriptor]
+    skip_descriptors: dict[str, SkipDescriptors]
+    disabled_kv_layer_indices: set[int]
 
 
 _layer_init_contexts: contextvars.ContextVar[tuple[_LayerInitContext, ...]] = contextvars.ContextVar(
@@ -58,8 +59,7 @@ def apply_generic_heterogeneous_modeling_if_applicable(model: PreTrainedModel) -
     """Apply heterogeneous per-layer modeling during model initialization.
 
     This function resolves the model's ``HeterogeneousModelingSpec``, validates its
-    configured skips, records which layers do not update the KV cache, and registers
-    the layer-initialization context. The patched layer class uses this context to
+    configured skips, and registers the layer-initialization context. The patched layer class uses this context to
     initialize each layer with its resolved config, apply skip replacements, and
     select layer-specific attention masks.
 
@@ -92,6 +92,7 @@ def apply_generic_heterogeneous_modeling_if_applicable(model: PreTrainedModel) -
         layer_cls=heterogeneous_modeling_spec.layer_cls,
         layer_idx_resolver=heterogeneous_modeling_spec.layer_idx_resolver,
         skip_descriptors=skip_descriptors,
+        disabled_kv_layer_indices=disabled_kv_layer_indices,
     )
     _layer_init_contexts.set((*_layer_init_contexts.get(), context))
     _patch_layer_init(heterogeneous_modeling_spec.layer_cls)
@@ -173,6 +174,7 @@ def _patch_layer_init(layer_cls: type[nn.Module]) -> None:
                     layer=self,
                     skip_descriptor=context.skip_descriptors[skip_type],
                     layer_idx=layer_idx,
+                    context=context,
                 )
 
             # --- Patch forward for attention mask selection ---
@@ -188,19 +190,35 @@ def _patch_layer_forward_for_attention_mask_layer_selection(
     layer_idx: int,
 ) -> None:
     orig_forward = layer.forward
+    positional_names = [
+        name
+        for name, parameter in inspect.signature(orig_forward).parameters.items()
+        if parameter.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    mask_position = positional_names.index("attention_mask") if "attention_mask" in positional_names else None
 
     @wraps(orig_forward)
     def _patched_forward(self, *args, **kwargs):
-        attention_mask = kwargs.get("attention_mask")
+        if mask_position is not None and mask_position < len(args):
+            attention_mask = args[mask_position]
+            mask_is_positional = True
+        else:
+            attention_mask = kwargs.get("attention_mask")
+            mask_is_positional = False
+
         if isinstance(attention_mask, AttentionMasksByLayerIdx):
-            kwargs["attention_mask"] = attention_mask[layer_idx]
+            if mask_is_positional:
+                args = (*args[:mask_position], attention_mask[layer_idx], *args[mask_position + 1 :])
+            else:
+                kwargs["attention_mask"] = attention_mask[layer_idx]
+
         return orig_forward(*args, **kwargs)
 
     layer.forward = MethodType(_patched_forward, layer)
 
 
 def _validate_skip_descriptors(
-    per_layer_skip_types: list[list[str]], skip_descriptors: dict[str, SkipDescriptor]
+    per_layer_skip_types: list[list[str]], skip_descriptors: dict[str, SkipDescriptors]
 ) -> None:
     skip_types = {skip_type for layer_skip_types in per_layer_skip_types for skip_type in layer_skip_types}
     missing_descriptors = skip_types - skip_descriptors.keys()
@@ -211,13 +229,15 @@ def _validate_skip_descriptors(
 def _apply_skip_descriptor(
     *,
     layer: nn.Module,
-    skip_descriptor: SkipDescriptor,
+    skip_descriptor: SkipDescriptors,
     layer_idx: int,
+    context: _LayerInitContext,
 ) -> None:
+    """Apply the selected replacements and record disabled KV-cache updates in the initialization context."""
     generic_replacements = {}
     class_specific_replacements = {}
 
-    for key, replacement_module in skip_descriptor.replacements.items():
+    for key, replacement in skip_descriptor.items():
         if isinstance(key, tuple):
             member_name, cls = key
         else:
@@ -230,7 +250,7 @@ def _apply_skip_descriptor(
             )
 
         if cls is None:
-            generic_replacements[member_name] = replacement_module
+            generic_replacements[member_name] = replacement
             continue
 
         if not isinstance(_getattr_by_path(layer, member_name), cls):
@@ -241,14 +261,14 @@ def _apply_skip_descriptor(
                 f"Multiple class-specific skip replacements match layer {layer_idx} "
                 f"attribute {member_name} in class {layer.__class__.__name__}"
             )
-        class_specific_replacements[member_name] = replacement_module
+        class_specific_replacements[member_name] = replacement
 
-    for member_name, replacement_module in class_specific_replacements.items():
-        _setattr_by_path(layer, member_name, replacement_module())
+    selected_replacements = generic_replacements | class_specific_replacements
+    for member_name, replacement in selected_replacements.items():
+        _setattr_by_path(layer, member_name, replacement.factory())
 
-    for member_name, replacement_module in generic_replacements.items():
-        if member_name not in class_specific_replacements:
-            _setattr_by_path(layer, member_name, replacement_module())
+    if any(replacement.replaces_kv_cache_updater for replacement in selected_replacements.values()):
+        context.disabled_kv_layer_indices.add(layer_idx)
 
 
 def _getattr_by_path(obj: Any, attribute_path: str) -> Any:
