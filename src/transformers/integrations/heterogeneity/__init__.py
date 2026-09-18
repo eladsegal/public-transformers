@@ -17,7 +17,6 @@ from .configuration_utils import AmbiguousGlobalPerLayerAttributeError, Heteroge
 from .heterogeneous_modeling_spec import (
     HeterogeneousModelingSpec,
     SkipDescriptors,
-    SkipTargetSpec,
     get_heterogeneous_modeling_spec,
     nest_skip_descriptor_paths,
 )
@@ -38,7 +37,6 @@ __all__ = [
     "LayerIdxResolver",
     "ReturnEntry",
     "SkipDescriptors",
-    "SkipTargetSpec",
     "apply_generic_heterogeneous_modeling_if_applicable",
     "get_heterogeneous_modeling_spec",
     "get_skip_replacement_factory",

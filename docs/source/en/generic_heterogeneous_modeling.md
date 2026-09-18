@@ -80,8 +80,7 @@ requires a skip descriptor for each skip type, defining its effect on the layer.
 ## Skip descriptors
 
 The strings accepted in a configuration's per-layer `skip` lists are the keys of the spec's `skip_descriptors`.
-Each value is a dictionary mapping layer members to `SkipTargetSpec` objects. Each spec describes the target member
-and provides a factory for its no-op replacement:
+Each value is a dictionary mapping layer members to factories that create their no-op replacements:
 
 ```py
 import torch
@@ -90,7 +89,6 @@ from transformers.integrations.heterogeneity import (
     HeterogeneousModelingSpec,
     LayerIdxFromArgument,
     ReturnEntry,
-    SkipTargetSpec,
     get_skip_replacement_factory,
 )
 from transformers.models.llama.modeling_llama import LlamaAttention, LlamaDecoderLayer, LlamaMLP, LlamaRMSNorm
@@ -105,36 +103,28 @@ spec = HeterogeneousModelingSpec(
     layer_idx_resolver=LayerIdxFromArgument("layer_idx"),
     skip_descriptors={
         "attention": {
-            "input_layernorm": SkipTargetSpec(
-                replacement_factory=get_skip_replacement_factory(
-                    LlamaRMSNorm, ReturnEntry(arg_name="hidden_states", transform=identity)
-                ),
-                updates_kv_cache=False,
+            "input_layernorm": get_skip_replacement_factory(
+                LlamaRMSNorm, ReturnEntry(arg_name="hidden_states", transform=identity)
             ),
-            "self_attn": SkipTargetSpec(
-                replacement_factory=get_skip_replacement_factory(
-                    LlamaAttention, [ReturnEntry(arg_name="hidden_states", transform=torch.zeros_like), None]
-                ),
-                updates_kv_cache=True,
+            "self_attn": get_skip_replacement_factory(
+                LlamaAttention, [ReturnEntry(arg_name="hidden_states", transform=torch.zeros_like), None]
             ),
         },
         "mlp": {
-            "post_attention_layernorm": SkipTargetSpec(
-                replacement_factory=get_skip_replacement_factory(
-                    LlamaRMSNorm, ReturnEntry(arg_name="hidden_states", transform=identity)
-                ),
-                updates_kv_cache=False,
+            "post_attention_layernorm": get_skip_replacement_factory(
+                LlamaRMSNorm, ReturnEntry(arg_name="hidden_states", transform=identity)
             ),
-            "mlp": SkipTargetSpec(
-                replacement_factory=get_skip_replacement_factory(
-                    LlamaMLP, ReturnEntry(arg_name="x", transform=torch.zeros_like)
-                ),
-                updates_kv_cache=False,
+            "mlp": get_skip_replacement_factory(
+                LlamaMLP, ReturnEntry(arg_name="x", transform=torch.zeros_like)
             ),
         },
     },
 )
 ```
+
+> [!WARNING]
+> Currently, using the cache when the first attention layer is skipped isn't supported, as it may silently produce
+> incorrect results.
 
 ### Replacements
 
@@ -161,40 +151,21 @@ like this (excerpt):
 ```py
 skip_descriptors = {
     "mixer": {
-        "norm": SkipTargetSpec(
-            replacement_factory=get_skip_replacement_factory(
-                NemotronHRMSNorm, ReturnEntry(arg_name="hidden_states", transform=identity)
-            ),
-            updates_kv_cache=False,
+        "norm": get_skip_replacement_factory(
+            NemotronHRMSNorm, ReturnEntry(arg_name="hidden_states", transform=identity)
         ),
-        ("mixer", NemotronHAttention): SkipTargetSpec(
-            replacement_factory=get_skip_replacement_factory(
-                NemotronHAttention, [ReturnEntry(arg_name="hidden_states", transform=torch.zeros_like), None]
-            ),
-            updates_kv_cache=True,
+        ("mixer", NemotronHAttention): get_skip_replacement_factory(
+            NemotronHAttention, [ReturnEntry(arg_name="hidden_states", transform=torch.zeros_like), None]
         ),
-        ("mixer", NemotronHMoE): SkipTargetSpec(
-            replacement_factory=get_skip_replacement_factory(
-                NemotronHMoE, ReturnEntry(arg_name="hidden_states", transform=torch.zeros_like)
-            ),
-            updates_kv_cache=False,
+        ("mixer", NemotronHMoE): get_skip_replacement_factory(
+            NemotronHMoE, ReturnEntry(arg_name="hidden_states", transform=torch.zeros_like)
         ),
-        ("mixer", NemotronHMamba2Mixer): SkipTargetSpec(
-            replacement_factory=get_skip_replacement_factory(
-                NemotronHMamba2Mixer, ReturnEntry(arg_name="hidden_states", transform=torch.zeros_like)
-            ),
-            updates_kv_cache=False,
+        ("mixer", NemotronHMamba2Mixer): get_skip_replacement_factory(
+            NemotronHMamba2Mixer, ReturnEntry(arg_name="hidden_states", transform=torch.zeros_like)
         ),
     },
 }
 ```
-
-### KV cache
-
-Each `SkipTargetSpec` must say whether the original member updates the layer's KV cache. Set
-`updates_kv_cache=True` for a module that calls `past_key_values.update(...)`, usually the attention module.
-Use `False` for other members, such as an MLP, a norm, or a Mamba mixer. We use this to detect unsupported cache configurations.
-
 
 ## The resulting model
 

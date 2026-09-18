@@ -28,21 +28,8 @@ if TYPE_CHECKING:
     from transformers.modeling_utils import PreTrainedModel
 
 
-@dataclass(frozen=True)
-class SkipTargetSpec:
-    """Properties of a layer member targeted by a skip and the factory for its replacement.
-
-    Args:
-        replacement_factory: Creates the no-op module used in place of the matched layer member.
-        updates_kv_cache: Whether the original member updates the layer's KV cache.
-    """
-
-    replacement_factory: Callable[[], nn.Module]
-    updates_kv_cache: bool
-
-
 # Class-specific (member name, member class) keys take precedence over plain member names.
-SkipDescriptors: TypeAlias = dict[str | tuple[str, type], SkipTargetSpec]
+SkipDescriptors: TypeAlias = dict[str | tuple[str, type], Callable[[], "nn.Module"]]
 
 
 @dataclass(frozen=True)
@@ -70,13 +57,13 @@ def nest_skip_descriptor_paths(
     nested_descriptors = {}
     for skip_type, targets in skip_descriptors.items():
         nested_targets = {}
-        for key, target_spec in targets.items():
+        for key, replacement_factory in targets.items():
             if isinstance(key, tuple):
                 member_path, member_cls = key
                 nested_key = (f"{parent_path}.{member_path}", member_cls)
             else:
                 nested_key = f"{parent_path}.{key}"
-            nested_targets[nested_key] = target_spec
+            nested_targets[nested_key] = replacement_factory
 
         nested_descriptors[skip_type] = nested_targets
 

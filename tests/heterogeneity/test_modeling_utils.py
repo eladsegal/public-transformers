@@ -29,13 +29,24 @@ if is_torch_available():
         build_model,
         dummy_input_ids,
         forward_logits,
+        tiny_gpt_oss_config,
+        tiny_llama4_config,
         tiny_llama_config,
+        tiny_nemotron_h_config,
     )
-    from transformers import DynamicCache, LlamaConfig, LlamaForCausalLM, PreTrainedModel
+    from transformers import (
+        DynamicCache,
+        GptOssForCausalLM,
+        Llama4ForCausalLM,
+        LlamaConfig,
+        LlamaForCausalLM,
+        NemotronHForCausalLM,
+        PreTrainedModel,
+        StaticCache,
+    )
     from transformers.integrations.heterogeneity import (
         HeterogeneousModelingSpec,
         LayerIdxFromArgument,
-        SkipTargetSpec,
     )
     from transformers.integrations.heterogeneity.masking_utils import AttentionMasksByLayerIdx
     from transformers.modeling_layers import MtpModel
@@ -65,11 +76,7 @@ if is_torch_available():
         return HeterogeneousModelingSpec(
             layer_cls=layer_cls,
             layer_idx_resolver=LayerIdxFromArgument("layer_idx"),
-            skip_descriptors={
-                "attention": {
-                    "self_attn": SkipTargetSpec(replacement_factory=attention_replacement_cls, updates_kv_cache=True)
-                }
-            },
+            skip_descriptors={"attention": {"self_attn": attention_replacement_cls}},
         )
 
     def _toy_config(intermediate_size, skip_attention=False):
@@ -145,15 +152,13 @@ class TestHeterogeneousModeling(unittest.TestCase):
     def test_class_specific_skip_replacement_takes_precedence(self):
         spec = _toy_modeling_spec(_ToyDecoderLayer, _ToyNoOpAttention)
         spec.skip_descriptors["attention"] = {
-            "self_attn": SkipTargetSpec(_ToyNoOpAttention, updates_kv_cache=True),
-            ("self_attn", _ToyAttention): SkipTargetSpec(_ClassSpecificNoOpAttention, updates_kv_cache=False),
+            "self_attn": _ToyNoOpAttention,
+            ("self_attn", _ToyAttention): _ClassSpecificNoOpAttention,
         }
         with patch.object(_SingleLayerToyModel, "_heterogeneous_modeling_spec", spec):
             model = _SingleLayerToyModel(_toy_config(intermediate_size=32, skip_attention=True))
 
         self.assertIsInstance(model.layer.self_attn, _ClassSpecificNoOpAttention)
-        # Only the selected replacement's cache metadata should apply.
-        model(torch.ones(1), use_cache=True)
 
     def test_mtp_model_applies_per_layer_config_and_skips(self):
         config = tiny_llama_config(num_hidden_layers=2)
@@ -226,3 +231,66 @@ class TestHeterogeneousModeling(unittest.TestCase):
 
         torch.testing.assert_close(forward_logits(model_a, input_ids), expected_logits)
         forward_logits(model_b, input_ids)
+
+
+@require_torch
+class TestHeterogeneousCache(unittest.TestCase):
+    def tearDown(self):
+        cleanup(torch_device, gc_collect=True)
+
+    @parameterized.expand(
+        [
+            ("llama", {0: {"num_key_value_heads": 2}, 1: {"skip": ["attention"]}, 2: {"num_key_value_heads": 1}}),
+            ("gpt_oss", {0: {"sliding_window": 3}, 1: {"skip": ["attention"]}, 2: {"sliding_window": 4}}),
+            ("llama4", {0: {"attention_chunk_size": 2}, 1: {"attention_chunk_size": 3}, 2: {"skip": ["attention"]}}),
+            ("nemotron_h", {1: {"skip": ["mixer"]}, 3: {"skip": ["mixer"]}}),
+        ]
+    )
+    def test_cached_decoding_matches_uncached(self, name, overrides):
+        factory, model_class = {
+            "llama": (tiny_llama_config, LlamaForCausalLM),
+            "gpt_oss": (tiny_gpt_oss_config, GptOssForCausalLM),
+            "llama4": (tiny_llama4_config, Llama4ForCausalLM),
+            "nemotron_h": (tiny_nemotron_h_config, NemotronHForCausalLM),
+        }[name]
+        config = factory(per_layer_config=overrides)
+        model = build_model(config, model_class)
+        input_ids = torch.tensor([[0, 0, 3, 4, 5, 6], [1, 2, 3, 4, 5, 6]])
+        attention_mask = torch.tensor([[0, 0, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1]])
+        caches = (DynamicCache(config=config), StaticCache(config=config, max_cache_len=input_ids.shape[1]))
+
+        with torch.no_grad():
+            expected_logits = model(input_ids, attention_mask=attention_mask, use_cache=False).logits[:, -2:]
+            for cache in caches:
+                with self.subTest(cache_type=type(cache).__name__):
+                    model(
+                        input_ids[:, :-2], attention_mask=attention_mask[:, :-2], past_key_values=cache, use_cache=True
+                    )
+                    actual_logits = model(
+                        input_ids[:, -2:], attention_mask=attention_mask, past_key_values=cache, use_cache=True
+                    ).logits
+                    torch.testing.assert_close(actual_logits, expected_logits, rtol=1e-4, atol=1e-5)
+
+    def test_static_cache_generation_with_skipped_attention(self):
+        config = tiny_gpt_oss_config(
+            per_layer_config={0: {"sliding_window": 3}, 1: {"skip": ["attention"]}, 2: {"sliding_window": 4}},
+            pad_token_id=0,
+            eos_token_id=None,
+        )
+        config._attn_implementation = "eager"
+        model = build_model(config, GptOssForCausalLM)
+        input_ids = torch.tensor([[1, 3, 4, 5]])
+        generation_kwargs = {
+            "max_new_tokens": 3,
+            "do_sample": False,
+            "return_dict_in_generate": True,
+            "output_logits": True,
+        }
+        with torch.no_grad():
+            expected = model.generate(input_ids, use_cache=False, **generation_kwargs)
+            actual = model.generate(
+                input_ids, cache_implementation="static", disable_compile=True, **generation_kwargs
+            )
+
+        torch.testing.assert_close(actual.sequences, expected.sequences)
+        torch.testing.assert_close(actual.logits, expected.logits)

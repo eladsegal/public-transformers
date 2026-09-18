@@ -276,9 +276,9 @@ class TestSupportedHeterogeneousModels(unittest.TestCase):
 
         # Check skip structure: compare hetero model against reference layer expectations.
         replacement_types = tuple(
-            type(target_spec.replacement_factory())
+            type(replacement_factory())
             for skip_descriptor in (modeling_spec.skip_descriptors or {}).values()
-            for target_spec in skip_descriptor.values()
+            for replacement_factory in skip_descriptor.values()
         )
         ref_layer_cls = MODEL_FIXTURES[case.model_key].ref_layer_cls
         for i in range(config.num_hidden_layers):

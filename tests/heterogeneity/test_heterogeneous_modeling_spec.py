@@ -22,7 +22,6 @@ if is_torch_available():
     import torch
 
     from transformers.integrations.heterogeneity import (
-        SkipTargetSpec,
         get_heterogeneous_modeling_spec,
         nest_skip_descriptor_paths,
     )
@@ -33,10 +32,8 @@ class TestHeterogeneousModelingSpec(unittest.TestCase):
     def test_nest_skip_descriptor_paths_returns_nested_copies(self):
         skip_descriptors = {
             "mixer": {
-                "norm": SkipTargetSpec(replacement_factory=torch.nn.Identity, updates_kv_cache=False),
-                ("mixer", torch.nn.Linear): SkipTargetSpec(
-                    replacement_factory=torch.nn.Identity, updates_kv_cache=True
-                ),
+                "norm": torch.nn.Identity,
+                ("mixer", torch.nn.Linear): torch.nn.Identity,
             }
         }
 
@@ -47,8 +44,8 @@ class TestHeterogeneousModelingSpec(unittest.TestCase):
             {"wrapper.block.norm", ("wrapper.block.mixer", torch.nn.Linear)},
         )
         nested_targets = nested_descriptors["mixer"]
-        self.assertFalse(nested_targets["wrapper.block.norm"].updates_kv_cache)
-        self.assertTrue(nested_targets[("wrapper.block.mixer", torch.nn.Linear)].updates_kv_cache)
+        self.assertIs(nested_targets["wrapper.block.norm"], torch.nn.Identity)
+        self.assertIs(nested_targets[("wrapper.block.mixer", torch.nn.Linear)], torch.nn.Identity)
         self.assertEqual(set(skip_descriptors["mixer"]), {"norm", ("mixer", torch.nn.Linear)})
         self.assertIsNone(nest_skip_descriptor_paths(None, parent_path="wrapper.block"))
 
