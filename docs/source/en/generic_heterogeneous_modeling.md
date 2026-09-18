@@ -50,7 +50,7 @@ patches the initialization of the architecture's layer class so that:
    attribute overrides such as `intermediate_size` or `num_key_value_heads` apply naturally.
 2. Each skip type in the layer's `skip` applies a skip descriptor from the spec, replacing the layer members it lists
    with modules that turn them into a no-op.
-3. Sliding-window and chunked masks are packaged in a container keyed by the indices of the layers that consume them.
+3. Sliding-window and chunked attention masks are packaged in a container keyed by the indices of the layers that consume them.
    Layers can share a mask when their mask settings and cache geometry match. The appropriate mask is selected
    automatically before each layer's forward call.
 
@@ -80,8 +80,8 @@ requires a skip descriptor for each skip type, defining its effect on the layer.
 ## Skip descriptors
 
 The strings accepted in a configuration's per-layer `skip` lists are the keys of the spec's `skip_descriptors`.
-Each value is a dictionary mapping layer members to `SkipReplacement` objects, which provide a replacement factory
-and declare whether replacing that member disables the layer's KV-cache updates:
+Each value is a dictionary mapping layer members to `SkipTargetSpec` objects. Each spec describes the target member
+and provides a factory for its no-op replacement:
 
 ```py
 import torch
@@ -90,7 +90,7 @@ from transformers.integrations.heterogeneity import (
     HeterogeneousModelingSpec,
     LayerIdxFromArgument,
     ReturnEntry,
-    SkipReplacement,
+    SkipTargetSpec,
     get_skip_replacement_factory,
 )
 from transformers.models.llama.modeling_llama import LlamaAttention, LlamaDecoderLayer, LlamaMLP, LlamaRMSNorm
@@ -105,29 +105,31 @@ spec = HeterogeneousModelingSpec(
     layer_idx_resolver=LayerIdxFromArgument("layer_idx"),
     skip_descriptors={
         "attention": {
-            "input_layernorm": SkipReplacement(
-                factory=get_skip_replacement_factory(
+            "input_layernorm": SkipTargetSpec(
+                replacement_factory=get_skip_replacement_factory(
                     LlamaRMSNorm, ReturnEntry(arg_name="hidden_states", transform=identity)
                 ),
-                replaces_kv_cache_updater=False,
+                updates_kv_cache=False,
             ),
-            "self_attn": SkipReplacement(
-                factory=get_skip_replacement_factory(
+            "self_attn": SkipTargetSpec(
+                replacement_factory=get_skip_replacement_factory(
                     LlamaAttention, [ReturnEntry(arg_name="hidden_states", transform=torch.zeros_like), None]
                 ),
-                replaces_kv_cache_updater=True,
+                updates_kv_cache=True,
             ),
         },
         "mlp": {
-            "post_attention_layernorm": SkipReplacement(
-                factory=get_skip_replacement_factory(
+            "post_attention_layernorm": SkipTargetSpec(
+                replacement_factory=get_skip_replacement_factory(
                     LlamaRMSNorm, ReturnEntry(arg_name="hidden_states", transform=identity)
                 ),
-                replaces_kv_cache_updater=False,
+                updates_kv_cache=False,
             ),
-            "mlp": SkipReplacement(
-                factory=get_skip_replacement_factory(LlamaMLP, ReturnEntry(arg_name="x", transform=torch.zeros_like)),
-                replaces_kv_cache_updater=False,
+            "mlp": SkipTargetSpec(
+                replacement_factory=get_skip_replacement_factory(
+                    LlamaMLP, ReturnEntry(arg_name="x", transform=torch.zeros_like)
+                ),
+                updates_kv_cache=False,
             ),
         },
     },
@@ -159,29 +161,29 @@ like this (excerpt):
 ```py
 skip_descriptors = {
     "mixer": {
-        "norm": SkipReplacement(
-            factory=get_skip_replacement_factory(
+        "norm": SkipTargetSpec(
+            replacement_factory=get_skip_replacement_factory(
                 NemotronHRMSNorm, ReturnEntry(arg_name="hidden_states", transform=identity)
             ),
-            replaces_kv_cache_updater=False,
+            updates_kv_cache=False,
         ),
-        ("mixer", NemotronHAttention): SkipReplacement(
-            factory=get_skip_replacement_factory(
+        ("mixer", NemotronHAttention): SkipTargetSpec(
+            replacement_factory=get_skip_replacement_factory(
                 NemotronHAttention, [ReturnEntry(arg_name="hidden_states", transform=torch.zeros_like), None]
             ),
-            replaces_kv_cache_updater=True,
+            updates_kv_cache=True,
         ),
-        ("mixer", NemotronHMoE): SkipReplacement(
-            factory=get_skip_replacement_factory(
+        ("mixer", NemotronHMoE): SkipTargetSpec(
+            replacement_factory=get_skip_replacement_factory(
                 NemotronHMoE, ReturnEntry(arg_name="hidden_states", transform=torch.zeros_like)
             ),
-            replaces_kv_cache_updater=False,
+            updates_kv_cache=False,
         ),
-        ("mixer", NemotronHMamba2Mixer): SkipReplacement(
-            factory=get_skip_replacement_factory(
+        ("mixer", NemotronHMamba2Mixer): SkipTargetSpec(
+            replacement_factory=get_skip_replacement_factory(
                 NemotronHMamba2Mixer, ReturnEntry(arg_name="hidden_states", transform=torch.zeros_like)
             ),
-            replaces_kv_cache_updater=False,
+            updates_kv_cache=False,
         ),
     },
 }
@@ -189,15 +191,10 @@ skip_descriptors = {
 
 ### KV cache
 
-`replaces_kv_cache_updater` states whether the replacement disables the member that updates the layer's KV cache — the
-module that calls `past_key_values.update(...)`. It is required for each `SkipReplacement`, and is `True` for an attention
-replacement and `False` for an MLP replacement. Layers whose skips replace the KV cache updater never hold KV states,
-and this declaration is used to omit their attention masks and check whether cached execution is supported.
+Each `SkipTargetSpec` must say whether the original member updates the layer's KV cache. Set
+`updates_kv_cache=True` for a module that calls `past_key_values.update(...)`, usually the attention module.
+Use `False` for other members, such as an MLP, a norm, or a Mamba mixer. We use this to detect unsupported cache configurations.
 
-`replaces_kv_cache_updater` states whether the skip replaces the member that updates the layer's KV cache — the module
-that calls `past_key_values.update(...)`. It is `True` for an attention skip and `False` for an MLP skip. Layers whose
-skips replace the KV cache updater never hold KV states, and this declaration is how caches and attention masks know to
-read cache metadata from a different layer.
 
 ## The resulting model
 

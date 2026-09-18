@@ -97,14 +97,9 @@ def _create_attention_masks_by_layer_idx(
 ) -> AttentionMasksByLayerIdx:
     attention_masks = AttentionMasksByLayerIdx()
     masks_by_reuse_key: dict[tuple[Any, ...], Any] = {}
-    disabled_kv_layer_indices = set(config.get_disabled_kv_layer_indices())
     past_key_values = kwargs.get("past_key_values")
 
     for layer_idx in _get_mask_layer_indices(config, create_mask_fn):
-        if layer_idx in disabled_kv_layer_indices:
-            attention_masks[layer_idx] = None
-            continue
-
         # Resolving a layer config copies it, which currently prevents full-graph compilation of this path.
         layer_config = config.per_layer_config[layer_idx]
 

@@ -29,20 +29,20 @@ if TYPE_CHECKING:
 
 
 @dataclass(frozen=True)
-class SkipReplacement:
-    """A replacement module factory and its effect on the layer's KV cache.
+class SkipTargetSpec:
+    """Properties of a layer member targeted by a skip and the factory for its replacement.
 
     Args:
-        factory: Creates the module used in place of the matched layer member.
-        replaces_kv_cache_updater: Whether replacing this member disables the layer's KV-cache updates.
+        replacement_factory: Creates the no-op module used in place of the matched layer member.
+        updates_kv_cache: Whether the original member updates the layer's KV cache.
     """
 
-    factory: Callable[[], nn.Module]
-    replaces_kv_cache_updater: bool
+    replacement_factory: Callable[[], nn.Module]
+    updates_kv_cache: bool
 
 
 # Class-specific (member name, member class) keys take precedence over plain member names.
-SkipDescriptors: TypeAlias = dict[str | tuple[str, type], SkipReplacement]
+SkipDescriptors: TypeAlias = dict[str | tuple[str, type], SkipTargetSpec]
 
 
 @dataclass(frozen=True)
@@ -68,17 +68,17 @@ def nest_skip_descriptor_paths(
         return None
 
     nested_descriptors = {}
-    for skip_type, replacements in skip_descriptors.items():
-        nested_replacements = {}
-        for key, replacement in replacements.items():
+    for skip_type, targets in skip_descriptors.items():
+        nested_targets = {}
+        for key, target_spec in targets.items():
             if isinstance(key, tuple):
                 member_path, member_cls = key
                 nested_key = (f"{parent_path}.{member_path}", member_cls)
             else:
                 nested_key = f"{parent_path}.{key}"
-            nested_replacements[nested_key] = replacement
+            nested_targets[nested_key] = target_spec
 
-        nested_descriptors[skip_type] = nested_replacements
+        nested_descriptors[skip_type] = nested_targets
 
     return nested_descriptors
 

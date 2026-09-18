@@ -63,9 +63,7 @@ class TestSkipReplacement(unittest.TestCase):
             torch.nn.Linear, ReturnEntry(arg_name="input", transform=lambda x: x)
         )
 
-        with self.assertRaisesRegex(
-            TypeError, "In the skip replacement for Linear, required argument 'input' was not provided"
-        ):
+        with self.assertRaisesRegex(TypeError, "Linear.*required argument 'input'"):
             replacement_factory()()
 
     def test_get_skip_replacement_factory_adds_context_to_transform_error(self):

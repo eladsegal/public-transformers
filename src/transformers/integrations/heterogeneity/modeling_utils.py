@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import contextvars
+import inspect
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -23,6 +24,7 @@ from functools import wraps
 from types import MethodType
 from typing import TYPE_CHECKING, Any
 
+from transformers.integrations.heterogeneity.cache_utils import guard_unsupported_cached_execution
 from transformers.integrations.heterogeneity.heterogeneous_modeling_spec import (
     SkipDescriptors,
     get_heterogeneous_modeling_spec,
@@ -77,14 +79,15 @@ def apply_generic_heterogeneous_modeling_if_applicable(model: PreTrainedModel) -
     skip_descriptors = heterogeneous_modeling_spec.skip_descriptors or {}
     _validate_skip_descriptors(per_layer_skip_types, skip_descriptors)
 
-    model.config._heterogeneity_spec.generic_modeling_applied = True
-
-    # Record which layers have their KV-cache update disabled on the config's heterogeneity spec,
-    # where cache construction (e.g. `StaticCache`) can read it from the config alone.
-    model.config._heterogeneity_spec.disabled_kv_layer_indices = tuple(
-        layer_idx
-        for layer_idx, skip_types in enumerate(per_layer_skip_types)
-        if any(skip_descriptors[skip_type].replaces_kv_cache_updater for skip_type in skip_types)
+    # A model wrapper (e.g. LlamaForCausalLM) and its backbone (e.g. LlamaModel) may share the same config.
+    # Share the collected indices so both receive the same cached-execution restrictions.
+    disabled_kv_layer_indices = next(
+        (
+            context.disabled_kv_layer_indices
+            for context in _layer_init_contexts.get()
+            if context.model.config is model.config
+        ),
+        set(),
     )
 
     context = _LayerInitContext(
@@ -103,8 +106,9 @@ def support_generic_heterogeneous_modeling(orig_init: Callable[..., None]) -> Ca
 
     That function runs inside ``PreTrainedModel.__init__`` and registers temporary state that is used later, when the
     model subclass creates its layers. This wrapper keeps that state available across the model's ``super().__init__()``
-    chain and restores the previous state when initialization finishes. Nested models receive their own nested scope.
-    If generic heterogeneous modeling is not applied, the wrapper does not change model initialization.
+    chain and restores the previous state when initialization finishes. After construction succeeds, the collected skip
+    information is used to guard unsupported cached execution. Nested models receive their own nested scope. If generic
+    heterogeneous modeling is not applied, the wrapper does not change model initialization.
     """
     if getattr(orig_init, "_scoped_for_heterogeneous_modeling", False):
         return orig_init
@@ -118,7 +122,19 @@ def support_generic_heterogeneous_modeling(orig_init: Callable[..., None]) -> Ca
         model_init_contexts_token = _model_init_contexts.set((*model_init_contexts, self))
         layer_init_contexts_token = _layer_init_contexts.set(_layer_init_contexts.get())
         try:
-            return orig_init(self, *args, **kwargs)
+            result = orig_init(self, *args, **kwargs)
+
+            for context in _layer_init_contexts.get():
+                if context.model is self:
+                    guard_unsupported_cached_execution(
+                        self, disabled_kv_layer_indices=context.disabled_kv_layer_indices
+                    )
+
+                    self.config._heterogeneity_spec.generic_modeling_applied = True
+
+                    break
+
+            return result
         finally:
             _layer_init_contexts.reset(layer_init_contexts_token)
             _model_init_contexts.reset(model_init_contexts_token)
@@ -174,7 +190,7 @@ def _patch_layer_init(layer_cls: type[nn.Module]) -> None:
                     layer=self,
                     skip_descriptor=context.skip_descriptors[skip_type],
                     layer_idx=layer_idx,
-                    context=context,
+                    disabled_kv_layer_indices=context.disabled_kv_layer_indices,
                 )
 
             # --- Patch forward for attention mask selection ---
@@ -231,13 +247,13 @@ def _apply_skip_descriptor(
     layer: nn.Module,
     skip_descriptor: SkipDescriptors,
     layer_idx: int,
-    context: _LayerInitContext,
+    disabled_kv_layer_indices: set[int],
 ) -> None:
-    """Apply the selected replacements and record disabled KV-cache updates in the initialization context."""
-    generic_replacements = {}
-    class_specific_replacements = {}
+    """Apply the selected replacements and record layers whose KV-cache updates are disabled."""
+    generic_targets = {}
+    class_specific_targets = {}
 
-    for key, replacement in skip_descriptor.items():
+    for key, target_spec in skip_descriptor.items():
         if isinstance(key, tuple):
             member_name, cls = key
         else:
@@ -250,25 +266,25 @@ def _apply_skip_descriptor(
             )
 
         if cls is None:
-            generic_replacements[member_name] = replacement
+            generic_targets[member_name] = target_spec
             continue
 
         if not isinstance(_getattr_by_path(layer, member_name), cls):
             continue
 
-        if member_name in class_specific_replacements:
+        if member_name in class_specific_targets:
             raise ValueError(
                 f"Multiple class-specific skip replacements match layer {layer_idx} "
                 f"attribute {member_name} in class {layer.__class__.__name__}"
             )
-        class_specific_replacements[member_name] = replacement
+        class_specific_targets[member_name] = target_spec
 
-    selected_replacements = generic_replacements | class_specific_replacements
-    for member_name, replacement in selected_replacements.items():
-        _setattr_by_path(layer, member_name, replacement.factory())
+    selected_targets = generic_targets | class_specific_targets
+    for member_name, target_spec in selected_targets.items():
+        _setattr_by_path(layer, member_name, target_spec.replacement_factory())
 
-    if any(replacement.replaces_kv_cache_updater for replacement in selected_replacements.values()):
-        context.disabled_kv_layer_indices.add(layer_idx)
+    if any(target_spec.updates_kv_cache for target_spec in selected_targets.values()):
+        disabled_kv_layer_indices.add(layer_idx)
 
 
 def _getattr_by_path(obj: Any, attribute_path: str) -> Any:
