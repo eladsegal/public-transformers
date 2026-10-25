@@ -56,7 +56,7 @@ class NemotronHModelTester:
         use_labels=True,
         vocab_size=99,
         hidden_size=32,
-        layers_block_type=["linear_attention", "moe", "linear_attention", "full_attention", "moe"],
+        layers_block_type=["linear_attention", "moe", "linear_attention", "full_attention", "moe", "full_attention"],
         num_attention_heads=4,
         num_key_value_heads=2,
         head_dim=32,
@@ -728,12 +728,10 @@ class NemotronHModelTest(
 
         # Test the model tester config
         config2 = self.model_tester.get_config()
-        self.assertEqual(len(config2.layers_block_type), 5)
-        self.assertEqual(config2.layers_block_type[0], "linear_attention")
-        self.assertEqual(config2.layers_block_type[1], "moe")
-        self.assertEqual(config2.layers_block_type[2], "linear_attention")
-        self.assertEqual(config2.layers_block_type[3], "full_attention")
-        self.assertEqual(config2.layers_block_type[4], "moe")
+        self.assertEqual(
+            config2.layers_block_type,
+            ["linear_attention", "moe", "linear_attention", "full_attention", "moe", "full_attention"],
+        )
 
     def test_generate_with_and_without_cache(self):
         """Test that generation with and without cache produces identical outputs"""

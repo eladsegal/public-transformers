@@ -127,6 +127,7 @@ from transformers.utils.output_capturing import CompileableContextVar, OutputRec
 
 from .exporters.test_export import ExportTesterMixin
 from .generation.test_utils import GenerationTesterMixin
+from .heterogeneity.test_heterogeneous_modeling_mixin import HeterogeneousModelingTesterMixin
 
 
 if is_torch_available():
@@ -746,7 +747,7 @@ UNSHIFTED_LM_HEADS = {
 
 
 @require_torch
-class ModelTesterMixin(ExportTesterMixin):
+class ModelTesterMixin(ExportTesterMixin, HeterogeneousModelingTesterMixin):
     model_tester = None
     all_model_classes = ()
     test_resize_embeddings = True
