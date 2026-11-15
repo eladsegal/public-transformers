@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
+
 from transformers.testing_utils import is_torch_available, torch_device
 
 
@@ -63,14 +65,14 @@ def _get_layer_indices_by_skip_type(model: "PreTrainedModel") -> dict[tuple[type
     return layer_indices_by_skip_type
 
 
-def _prefill_cache(model: "PreTrainedModel", input_ids: "torch.Tensor") -> "DynamicCache":
-    """Run `input_ids` through `model` with a cache, and return the cache.
+def _prefill_cache(model: "PreTrainedModel", inputs: dict) -> "DynamicCache":
+    """Run `inputs` through `model` with a cache, and return the cache.
 
     The cache is built from the model's config, so it leaves out a layer's cache when the layer's skips replace every
     member that `cache_writers` lists as writing it."""
     cache = DynamicCache(config=model.config)
     with torch.no_grad():
-        model(input_ids, past_key_values=cache, use_cache=True)
+        model(**inputs, cache=cache)
     return cache
 
 
@@ -95,7 +97,7 @@ class HeterogeneousModelingTesterMixin:
     build the first model class, usually the base model, from the model tester's config, so they check only the kinds
     of layers that a model built from this config has.
 
-    Expected attributes provided by [`ModelTesterMixin`]: `all_model_classes` and `model_tester`.
+    Expected attributes provided by [`ModelTesterMixin`]: `all_model_classes`, `model_tester` and `_prepare_for_class`.
     """
 
     def _skip_if_no_heterogeneous_modeling_specs(self):
@@ -115,9 +117,13 @@ class HeterogeneousModelingTesterMixin:
         self.assertTrue(config.generic_heterogeneous_modeling_applied)
         return model
 
-    def _get_input_ids(self) -> "torch.Tensor":
+    def _get_inputs(self, model: "PreTrainedModel", use_cache: bool) -> dict:
         _, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
-        return inputs_dict["input_ids"].to(torch_device)
+        inputs = self._prepare_for_class(inputs_dict, type(model))
+        # Models that never keep a cache, such as encoders, don't take `use_cache`
+        if "use_cache" in inspect.signature(model.forward).parameters:
+            inputs["use_cache"] = use_cache
+        return inputs
 
     def test_heterogeneous_modeling_specs_build_every_layer(self):
         """Test that the model builds with its specs applied. This fails when the specs' layer classes don't cover
@@ -138,7 +144,7 @@ class HeterogeneousModelingTesterMixin:
         The test doesn't check the values of those outputs."""
         self._skip_if_no_heterogeneous_modeling_specs()
         model = self._build_heterogeneous_model(per_layer_config={})
-        input_ids = self._get_input_ids()
+        inputs = self._get_inputs(model, use_cache=False)
 
         for (layer_cls, skip_type), layer_indices in _get_layer_indices_by_skip_type(model).items():
             self.assertTrue(
@@ -150,7 +156,7 @@ class HeterogeneousModelingTesterMixin:
                 with self.subTest(skip_type=skip_type, layer_idx=layer_idx):
                     skipped_model = self._build_heterogeneous_model({layer_idx: {"skip": [skip_type]}})
                     with torch.no_grad():
-                        skipped_model(input_ids, use_cache=False)
+                        skipped_model(**inputs)
 
     def test_heterogeneous_modeling_specs_cache_writers(self):
         """Test that `cache_writers` matches the layers of the tester's model.
@@ -163,15 +169,17 @@ class HeterogeneousModelingTesterMixin:
         cache but not its attention mask."""
         self._skip_if_no_heterogeneous_modeling_specs()
         model = self._build_heterogeneous_model(per_layer_config={})
-        input_ids = self._get_input_ids()
+        if "cache" not in inspect.signature(model.forward).parameters:
+            self.skipTest(reason=f"{type(model).__name__} doesn't take a cache")
+        inputs = self._get_inputs(model, use_cache=True)
         # Some models keep caches that nothing writes even without skips, so only what a skip changes counts
-        unwritten_caches_without_skips = _get_unwritten_caches(_prefill_cache(model, input_ids))
+        unwritten_caches_without_skips = _get_unwritten_caches(_prefill_cache(model, inputs))
 
         for (_, skip_type), layer_indices in _get_layer_indices_by_skip_type(model).items():
             for layer_idx in layer_indices:
                 with self.subTest(skip_type=skip_type, layer_idx=layer_idx):
                     skipped_model = self._build_heterogeneous_model({layer_idx: {"skip": [skip_type]}})
-                    unwritten_caches = _get_unwritten_caches(_prefill_cache(skipped_model, input_ids))[layer_idx]
+                    unwritten_caches = _get_unwritten_caches(_prefill_cache(skipped_model, inputs))[layer_idx]
                     unwritten_caches -= unwritten_caches_without_skips[layer_idx]
                     self.assertFalse(
                         unwritten_caches,
